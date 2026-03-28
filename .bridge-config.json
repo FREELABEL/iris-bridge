@@ -1,0 +1,42 @@
+{
+  "fileSystem": {
+    "enabled": true,
+    "allowedRoots": [
+      "~/Sites/freelabel/fl-docker-dev/"
+    ],
+    "deniedPaths": [
+      ".env",
+      "*.key",
+      ".ssh",
+      "credentials*",
+      "*.pem",
+      "*.p12",
+      "*.pfx",
+      "id_rsa",
+      "id_ed25519",
+      ".git/config",
+      "auth.json"
+    ],
+    "maxReadBytes": 102400,
+    "maxWriteBytes": 51200,
+    "executeEnabled": true,
+    "executeTimeout": 30,
+    "executeMaxTimeout": 120,
+    "executeDenyCommands": [
+      "rm -rf /",
+      "rm -rf ~",
+      "dd ",
+      "mkfs",
+      "shutdown",
+      "reboot",
+      "halt",
+      "init 0",
+      "init 6",
+      ":(){ :|:& };:",
+      "> /dev/sda"
+    ]
+  },
+  "auth": {
+    "apiKey": "bridge-secret-key"
+  }
+}

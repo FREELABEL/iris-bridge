@@ -1,0 +1,21 @@
+{
+  "name": "coding-agent-bridge",
+  "version": "1.1.0",
+  "description": "Local bridge server that wraps Claude Code and OpenCode CLIs for the IRIS coding session system. Supports daemon mode for distributed cloud task execution.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "daemon": "node daemon.js",
+    "status": "curl -s http://localhost:3200/health",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.0",
+    "dotenv": "^16.3.0",
+    "express": "^4.18.0",
+    "form-data": "^4.0.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "pusher-js": "^8.4.0"
+  }
+}
