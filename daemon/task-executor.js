@@ -115,15 +115,16 @@ class TaskExecutor {
     this.runningTasks = new Map() // taskId → childProcess
     this.flApiPath = findFlApiPath()
     this.dockerMode = null // lazily detected
+    const verbose = process.env.DAEMON_VERBOSE || process.env.FL_API_PATH || process.env.FREELABEL_PATH
     if (this.flApiPath) {
-      console.log(`[executor] fl-api path: ${this.flApiPath}`)
-    } else {
+      if (verbose) console.log(`[executor] fl-api path: ${this.flApiPath}`)
+    } else if (verbose) {
       console.warn('[executor] fl-api not found — artisan tasks will fail. Set FL_API_PATH env var.')
     }
     this.freelabelPath = findFreelabelPath()
     if (this.freelabelPath) {
-      console.log(`[executor] freelabel path: ${this.freelabelPath}`)
-    } else {
+      if (verbose) console.log(`[executor] freelabel path: ${this.freelabelPath}`)
+    } else if (verbose) {
       console.warn('[executor] freelabel root not found — som tasks will fail. Set FREELABEL_PATH env var.')
     }
   }
