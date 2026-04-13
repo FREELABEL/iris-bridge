@@ -56,7 +56,7 @@ if (!fs.existsSync(IRIS_DIR)) fs.mkdirSync(IRIS_DIR, { recursive: true })
 // Helper: clean up socket file (no-op on Windows named pipes)
 function cleanupSocket () {
   if (process.platform !== 'win32') {
-    cleanupSocket()
+    try { fs.unlinkSync(SOCKET_PATH) } catch {}
   }
 }
 
