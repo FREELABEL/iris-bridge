@@ -147,12 +147,15 @@ class ScheduleRegistry {
 
         console.log(`[schedules] [${ts}] ${schedule.filename} → ${status} (${duration}ms)`)
 
-        // Update schedule state
+        // Update schedule state (including last output for CLI/API)
         schedule.running = false
         schedule.started_at = null
         schedule.last_run = new Date().toISOString()
         schedule.last_status = status
         schedule.last_duration_ms = duration
+        schedule.last_exit_code = code
+        schedule.last_stdout = stdout.slice(-4000)
+        schedule.last_stderr = stderr.slice(-2000)
         schedule.run_count = (schedule.run_count || 0) + 1
         this._save()
 
