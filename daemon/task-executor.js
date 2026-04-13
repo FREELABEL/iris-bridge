@@ -61,7 +61,18 @@ function findFreelabelPath () {
     const pkg = path.join(process.env.FREELABEL_PATH, 'package.json')
     if (fs.existsSync(pkg)) return process.env.FREELABEL_PATH
   }
-  // 2. Relative paths from daemon/ directory
+  // 2. Read from ~/.iris/config.json
+  try {
+    const configPath = path.join(os.homedir(), '.iris', 'config.json')
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+      if (config.freelabel_path) {
+        const pkg = path.join(config.freelabel_path, 'package.json')
+        if (fs.existsSync(pkg)) return config.freelabel_path
+      }
+    }
+  } catch { /* continue */ }
+  // 3. Relative paths from daemon/ directory
   const candidates = [
     path.resolve(__dirname, '../../..'),  // fl-docker-dev/coding-agent-bridge/daemon/ → freelabel root
     path.resolve(__dirname, '../../../..') // one level up
