@@ -1482,8 +1482,21 @@ LIMIT ${limit}
     }
 
     try {
-      // Fetch full task details
-      const task = await this.cloud.fetchTask(event.task_id)
+      // Fetch full task details (retry with backoff — Pusher event can arrive before DB commit)
+      let task
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          task = await this.cloud.fetchTask(event.task_id)
+          break
+        } catch (fetchErr) {
+          if (attempt < 2 && fetchErr.message?.includes('404')) {
+            console.log(`[daemon] Task fetch retry ${attempt + 1}/3 (waiting for DB commit)...`)
+            await new Promise(r => setTimeout(r, (attempt + 1) * 1000))
+          } else {
+            throw fetchErr
+          }
+        }
+      }
 
       // Accept the task
       await this.cloud.acceptTask(event.task_id)
