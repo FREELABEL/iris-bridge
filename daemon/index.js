@@ -60,6 +60,7 @@ class Daemon {
     this.ingestBuffer = [] // received A2A payloads
     this.pendingTaskIds = new Set() // tasks received via Pusher but not yet in executor.runningTasks
     this.recentlyRejectedTasks = new Map() // taskId → timestamp (prevents heartbeat doom loops)
+    this.recentlySeenTasks = new Map() // taskId → timestamp (dedup duplicate Pusher events)
     this._browserTaskLock = false // mutex: only one browser task at a time
 
     // Mesh networking (offline/LAN peer-to-peer)
@@ -1434,6 +1435,25 @@ LIMIT ${limit}
   async handleTaskDispatched (event) {
     const ts = new Date().toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })
     console.log(`[daemon] [${ts}] Task dispatched: ${event.task_id} — "${event.title}"`)
+
+    // ── Dedup: skip duplicate Pusher events for the same task_id within 10s window
+    const DEDUP_COOLDOWN_MS = 10 * 1000 // 10 seconds
+    const lastSeen = this.recentlySeenTasks.get(event.task_id)
+    if (lastSeen && (Date.now() - lastSeen) < DEDUP_COOLDOWN_MS) {
+      console.log(`[daemon] DEDUP: Task ${event.task_id.substring(0, 8)} already received ${Math.round((Date.now() - lastSeen) / 1000)}s ago — ignoring duplicate Pusher event`)
+      return
+    }
+    this.recentlySeenTasks.set(event.task_id, Date.now())
+    // Clean up old dedup entries (> 60s)
+    for (const [id, time] of this.recentlySeenTasks) {
+      if (Date.now() - time > 60 * 1000) this.recentlySeenTasks.delete(id)
+    }
+
+    // Also skip if this task is already running in the executor
+    if (this.executor && this.executor.runningTasks.has(event.task_id)) {
+      console.log(`[daemon] DEDUP: Task ${event.task_id.substring(0, 8)} already running in executor — ignoring`)
+      return
+    }
 
     // ── Dedup: skip tasks we already rejected recently (prevents heartbeat doom loops)
     const REJECT_COOLDOWN_MS = 5 * 60 * 1000 // 5 minutes
