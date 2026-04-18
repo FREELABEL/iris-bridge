@@ -613,7 +613,7 @@ class Daemon {
 
     // ─── Script Execution (atomic push + run) ─────────────────────────
     app.post(`${prefix}/execute-script`, (req, res) => {
-      const { filename, content, args: scriptArgs, timeout_ms, persist } = req.body || {}
+      const { filename, content, args: scriptArgs, timeout_ms, persist, env: requestEnv } = req.body || {}
 
       if (!filename || !content) {
         return res.status(400).json({ error: 'filename and content required' })
@@ -643,9 +643,11 @@ class Daemon {
 
       console.log(`[execute-script] Running: ${cmd} ${filename} (timeout: ${timeout}ms, persist: ${!!persist})`)
 
+      // #58002: Merge project env vars (from --project flag) into child process environment
+      const childEnv = { ...process.env, ...(requestEnv && typeof requestEnv === 'object' ? requestEnv : {}) }
       const child = spawn(cmd, spawnArgs, {
         cwd: scriptsDir,
-        env: { ...process.env },
+        env: childEnv,
         stdio: ['pipe', 'pipe', 'pipe']
       })
 
