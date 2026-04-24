@@ -45,6 +45,20 @@ function resolveNode18Path () {
 const _node18BinDir = resolveNode18Path()
 
 /**
+ * Sanitize a process name to prevent shell injection.
+ * Only allows alphanumeric, dash, underscore, and dot.
+ * @param {string} name - Raw process name from task config
+ * @returns {string} Sanitized name safe for shell interpolation
+ */
+function sanitizeProcessName (name) {
+  const clean = String(name || '').replace(/[^a-zA-Z0-9._-]/g, '')
+  if (!clean || clean.length > 128) {
+    throw new Error(`Invalid process name: must be 1-128 chars of [a-zA-Z0-9._-], got: "${String(name || '').substring(0, 50)}"`)
+  }
+  return clean
+}
+
+/**
  * Split a prompt string into key=value tokens, preserving values that contain spaces.
  * e.g. "courses limit=20 strategy=AI Course | V3 dry=1"
  * → ["courses", "limit=20", "strategy=AI Course | V3", "dry=1"]
@@ -237,6 +251,33 @@ class TaskExecutor {
     const startTime = Date.now()
 
     const ts = () => new Date().toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+
+    // ── Dedup: reject if same task type is already running ──
+    // Prevents duplicate som_batch / discover when scheduler fires faster than execution
+    const singletonTypes = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan']
+    if (singletonTypes.includes(task.type)) {
+      const runningOfSameType = (this._runningTasks || []).filter(t => t.type === task.type)
+      if (runningOfSameType.length > 0) {
+        console.log(`[executor] [${ts()}] ⏭ Rejecting duplicate ${task.type} — already running (${runningOfSameType[0].id.substring(0, 12)})`)
+        try {
+          await this.cloud.submitResult(taskId, {
+            status: 'failed',
+            error: `Duplicate ${task.type} rejected — another instance is already running`,
+            output: '',
+            duration_ms: 0
+          })
+        } catch {}
+        return
+      }
+    }
+
+    // Track running tasks for dedup (cleaned up in finally block at end of execute)
+    if (!this._runningTasks) this._runningTasks = []
+    this._runningTasks.push({ id: taskId, type: task.type })
+    const _cleanupRunning = () => {
+      this._runningTasks = (this._runningTasks || []).filter(t => t.id !== taskId)
+    }
+
     const taskShort = taskId.substring(0, 12)
     const timeoutSec = task.timeout_seconds || task.config?.timeout_seconds || 'default'
     const nodeId = task.node_id ? task.node_id.substring(0, 12) : 'unknown'
@@ -260,6 +301,9 @@ class TaskExecutor {
     if (task.prompt) {
       console.log(`[executor]   Prompt:   ${task.prompt.substring(0, 80)}${task.prompt.length > 80 ? '…' : ''}`)
     }
+
+    // Notify Discord: task started
+    this.notifyDiscord(task, 'started', 0, [], null).catch(() => {})
 
     // Create isolated workspace
     const workspace = this.workspaces.create(taskId, task)
@@ -425,20 +469,25 @@ class TaskExecutor {
         ? '... (truncated) ...\n' + fullOutput.slice(-MAX_OUTPUT)
         : fullOutput
 
+      // For chainable tasks, non-zero exit doesn't mean total failure —
+      // e.g. discover tasks scrape successfully but Playwright exits non-zero
+      // because the n8n chat interaction failed or the wait was interrupted.
+      const taskStatus = result.exitCode === 0 ? 'completed' : 'completed_with_warnings'
       await this.cloud.submitResult(taskId, {
-        status: 'completed',
+        status: taskStatus,
         output: truncatedOutput,
         files,
         duration_ms: Date.now() - startTime,
         metadata: { exit_code: result.exitCode }
       })
 
-      console.log(`[executor] [${ts()}] Task ${taskId} completed in ${Date.now() - startTime}ms`)
+      console.log(`[executor] [${ts()}] Task ${taskId} ${taskStatus} in ${Date.now() - startTime}ms${result.exitCode ? ` (exit code ${result.exitCode})` : ''}`)
 
-      // ── Chain: YT feed import → SOM outreach batch ──
-      // When a discover task (YT feed) completes successfully, auto-dispatch outreach
-      // ── Auto-chain: discover → som_batch (with built-in enrichment) ──
-      if (task.type === 'discover' && task.config?.chain_outreach !== false) {
+      // ── Chain: discover → som_batch (DISABLED by default — use separate scheduled jobs) ──
+      // Chain was fragile: browser OOM, process crashes, YAML override bugs.
+      // Now discover (#761) and som_batch (#762) run as independent daily jobs, 15 min apart.
+      // Set chain_outreach=true explicitly to re-enable for manual dispatch.
+      if (task.type === 'discover' && task.config?.chain_outreach === true) {
         const chainPrompt = task.config?.outreach_prompt || 'limit=15 enrich=1 warmup=1 warmup_likes=3 warmup_follow=0'
         const chainUserId = task.user_id || task.config?.user_id || this._getConfigUserId()
         console.log(`[executor] [${ts()}] Chaining: discover complete → som_batch (${chainPrompt})`)
@@ -493,6 +542,90 @@ class TaskExecutor {
         }
       }
 
+      // ── Auto-chain: remotion/remotion_carousel → upload to CDN + post to Buffer ──
+      if ((task.type === 'remotion' || task.type === 'remotion_carousel') && task.config?.auto_publish !== false) {
+        const workspaceDir = workspace?.dir || workspace?.projectDir
+        if (workspaceDir) {
+          // Find all rendered PNGs in workspace (check /slides for carousel, or root for single)
+          const slidesDir = path.join(workspaceDir, 'slides')
+          const searchDirs = [slidesDir, workspaceDir]
+          let pngFiles = []
+          for (const dir of searchDirs) {
+            try {
+              if (fs.existsSync(dir)) {
+                const entries = fs.readdirSync(dir).filter(f => f.endsWith('.png'))
+                pngFiles = entries.map(f => ({ name: f, path: path.join(dir, f) }))
+                if (pngFiles.length > 0) break
+              }
+            } catch { /* skip */ }
+          }
+
+          if (pngFiles.length > 0) {
+            console.log(`[executor] [${ts()}] Remotion chain: uploading ${pngFiles.length} PNGs to CDN...`)
+            try {
+              // Read files and base64 encode
+              const artifacts = pngFiles.map(f => ({
+                filename: f.name,
+                content_base64: fs.readFileSync(f.path).toString('base64'),
+                content_type: 'image/png'
+              }))
+
+              // Upload to CDN via iris-api
+              const uploadResult = await this.cloud.post(`/api/v6/node-agent/tasks/${taskId}/artifacts`, { files: artifacts })
+              const cdnUrls = (uploadResult?.cdn_urls || []).map(u => u.url || u)
+              console.log(`[executor] [${ts()}] Remotion chain: ${cdnUrls.length} files uploaded to CDN`)
+
+              // Post cover slide (first image) to Buffer via fl-api
+              if (cdnUrls.length > 0) {
+                const caption = task.config?.caption || task.title || 'New from FreeLabel'
+                const flApiUrl = process.env.FL_API_URL || process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io'
+                const flApiToken = process.env.FL_API_TOKEN || ''
+
+                // Try loading token from SDK env if not in process env
+                if (!flApiToken) {
+                  try {
+                    const sdkEnv = path.join(os.homedir(), '.iris', 'sdk', '.env')
+                    if (fs.existsSync(sdkEnv)) {
+                      const envContent = fs.readFileSync(sdkEnv, 'utf-8')
+                      const match = envContent.match(/^FL_API_TOKEN=(.+)$/m)
+                      if (match) process.env.FL_API_TOKEN = match[1].trim()
+                    }
+                  } catch { /* fine */ }
+                }
+                const resolvedToken = process.env.FL_API_TOKEN || ''
+
+                if (resolvedToken) {
+                  try {
+                    const bufferPayload = JSON.stringify({
+                      image_url: cdnUrls[0],
+                      caption,
+                      draft: true
+                    })
+                    const url = new URL('/api/v1/buffer/post-image', flApiUrl)
+                    const res = await fetch(url.toString(), {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${resolvedToken}`
+                      },
+                      body: bufferPayload
+                    })
+                    const bufferResult = await res.json().catch(() => ({}))
+                    console.log(`[executor] [${ts()}] Remotion chain: Buffer post ${res.ok ? 'success' : 'failed'}`, bufferResult?.success ? '' : bufferResult?.errors?.[0]?.error || '')
+                  } catch (bufErr) {
+                    console.log(`[executor] [${ts()}] Remotion chain: Buffer post failed: ${bufErr.message}`)
+                  }
+                } else {
+                  console.log(`[executor] [${ts()}] Remotion chain: Skipping Buffer post (no FL_API_TOKEN in env or ~/.iris/sdk/.env)`)
+                }
+              }
+            } catch (uploadErr) {
+              console.log(`[executor] [${ts()}] Remotion chain: CDN upload failed: ${uploadErr.message}`)
+            }
+          }
+        }
+      }
+
       // Discord notification
       this.notifyDiscord(task, 'completed', Date.now() - startTime, outputLines).catch(() => {})
     } catch (err) {
@@ -515,6 +648,7 @@ class TaskExecutor {
         fs.unlinkSync(credentialFilePath)
         console.log(`[executor] Credential file cleaned up: ${credentialFilePath}`)
       }
+      _cleanupRunning() // Remove from dedup tracking
       this.runningTasks.delete(taskId)
       // Clean up workspace after a delay (keep for debugging)
       setTimeout(() => this.workspaces.cleanup(taskId), 60000)
@@ -845,14 +979,18 @@ class TaskExecutor {
             return
           }
 
-          // Build props from key=value args
-          const props = {}
-          for (const arg of remotionExtraArgs) {
-            const [k, ...vParts] = arg.split('=')
-            if (k && vParts.length) props[k] = vParts.join('=').replace(/\+/g, ' ')
+          // Build props: prefer config.props (full JSON) over key=value args
+          let props = {}
+          if (task.config && task.config.props && typeof task.config.props === 'object') {
+            props = task.config.props
+          } else {
+            for (const arg of remotionExtraArgs) {
+              const [k, ...vParts] = arg.split('=')
+              if (k && vParts.length) props[k] = vParts.join('=').replace(/\+/g, ' ')
+            }
           }
 
-          const isStill = composition.includes('Still') || composition.includes('Thumbnail')
+          const isStill = composition.includes('Still') || composition.includes('Thumbnail') || composition.includes('Ad')
           const ext = isStill ? 'png' : 'mp4'
           const outputFile = path.join(workspace.projectDir, `output.${ext}`)
 
@@ -1057,7 +1195,8 @@ class TaskExecutor {
           let scanAccounts
           try {
             const somConfig = require(path.join(scanRoot, 'tests/e2e/som-config.js'))
-            const activeAccounts = somConfig.getActiveAccounts()
+            const activeAccountsObj = somConfig.getActiveAccounts()
+            const activeAccounts = Object.values(activeAccountsObj)
             scanAccounts = scanTarget === 'all'
               ? activeAccounts
               : activeAccounts.filter(a => a.igAccount === scanTarget || a.id === scanTarget)
@@ -1385,7 +1524,7 @@ exit 1
           const pConfig = task.config || {}
           const pWsName = pConfig.workspace_name
           const pCommand = pConfig.command || task.prompt
-          const pName = pConfig.process_name || pWsName || `proc-${task.id.substring(0, 8)}`
+          const pName = sanitizeProcessName(pConfig.process_name || pWsName || `proc-${task.id.substring(0, 8)}`)
           const pWsDir = pWsName ? path.join('/data/workspace', pWsName) : workspace.dir
 
           if (pWsName && !fs.existsSync(pWsDir)) {
@@ -1491,7 +1630,7 @@ exit 1
         case 'deploy_project': {
           const pConfig = task.config || {}
           const repoUrl = pConfig.repo_url
-          const processName = pConfig.process_name || `proj-${task.id.substring(0, 8)}`
+          const processName = sanitizeProcessName(pConfig.process_name || `proj-${task.id.substring(0, 8)}`)
           const projectType = pConfig.project_type || 'sdk_bot'
           const envVars = pConfig.env_vars || {}
           const isRedeploy = pConfig.redeploy === true
@@ -1592,13 +1731,14 @@ exit 1
 
         case 'stop_project': {
           const stopConfig = task.config || {}
-          const stopName = stopConfig.process_name
+          const stopNameRaw = stopConfig.process_name
 
-          if (!stopName) {
+          if (!stopNameRaw) {
             reject(new Error('stop_project requires config.process_name'))
             return
           }
 
+          const stopName = sanitizeProcessName(stopNameRaw)
           cmd = '/bin/bash'
           args = ['-c', `pm2 delete "${stopName}" && pm2 save && echo "Process ${stopName} stopped"`]
           console.log(`[executor] Stop project: ${stopName}`)
@@ -1850,18 +1990,31 @@ exit 1
       const explicit = task.config?.timeout_seconds || (task.timeout_seconds > 600 ? task.timeout_seconds : null)
       const timeout = (explicit || typeDefault) * 1000
       const timeoutLabel = timeout / 1000
+      const chainableTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan']
+      const isChainable = chainableTypes.includes(task.type)
+
       const timer = setTimeout(() => {
         child.kill('SIGTERM')
         setTimeout(() => {
           if (!child.killed) child.kill('SIGKILL')
         }, 5000)
-        reject(new Error(`Task timed out after ${timeoutLabel}s`))
+        // Chainable tasks must still reach chain logic even on timeout —
+        // e.g. discover scrape + n8n paste already happened, just the wait
+        // got killed. Resolve so chains fire; report exit code for status.
+        if (isChainable) {
+          resolve({ exitCode: 124, timedOut: true })
+        } else {
+          reject(new Error(`Task timed out after ${timeoutLabel}s`))
+        }
       }, timeout)
 
       child.on('close', (code) => {
         clearTimeout(timer)
-        if (code === 0) {
-          resolve({ exitCode: 0 })
+        // Chainable tasks always resolve so the chain logic runs,
+        // even when Playwright exits non-zero (browser closed early,
+        // n8n chat issue, Ctrl+C, etc.)
+        if (code === 0 || isChainable) {
+          resolve({ exitCode: code || 0 })
         } else {
           reject(new Error(`Process exited with code ${code}`))
         }
@@ -2021,15 +2174,18 @@ exit 1
     if (!webhookUrl) return
 
     const isSuccess = status === 'completed'
+    const isStarted = status === 'started'
     const duration = this.formatDuration(durationMs)
     const stats = this.parseTaskOutput(outputLines)
 
     // Build embed fields
     const fields = [
       { name: 'Type', value: `\`${task.type}\``, inline: true },
-      { name: 'Duration', value: duration, inline: true },
-      { name: 'Status', value: isSuccess ? 'Completed' : 'Failed', inline: true }
+      { name: 'Status', value: isStarted ? '🚀 Started' : isSuccess ? '✅ Completed' : '❌ Failed', inline: true },
     ]
+    if (!isStarted) {
+      fields.push({ name: 'Duration', value: duration, inline: true })
+    }
 
     if (stats.scraped) fields.push({ name: 'Scraped', value: `${stats.scraped}`, inline: true })
     if (stats.created) fields.push({ name: 'Created', value: `${stats.created}`, inline: true })
@@ -2056,9 +2212,9 @@ exit 1
     if (description.length > 1500) description = description.substring(0, 1500) + '...'
 
     const embed = {
-      title: `${isSuccess ? '\u2705' : '\u274c'} ${task.title || task.type}`,
-      description: description || undefined,
-      color: isSuccess ? 0x22c55e : 0xef4444,
+      title: `${isStarted ? '\ud83d\ude80' : isSuccess ? '\u2705' : '\u274c'} ${task.title || task.type}`,
+      description: isStarted ? `Task \`${task.type}\` starting on daemon` : (description || undefined),
+      color: isStarted ? 0x3b82f6 : isSuccess ? 0x22c55e : 0xef4444,
       fields,
       footer: { text: `Hive Daemon \u2022 ${task.id.substring(0, 8)}` },
       timestamp: new Date().toISOString()

@@ -28,10 +28,14 @@ node -e "
 "
 
 echo "Bridge API key: $(printf '%.8s' "$API_KEY")..."
-echo "IRIS API URL: ${IRIS_API_URL:-https://app.heyiris.io}"
+echo "IRIS API URL: ${IRIS_API_URL:-https://web.heyiris.io}"
 
 # ─── Restore any persistent PM2 processes ───
 pm2 resurrect 2>/dev/null || true
+
+# ─── Docker needs external binding (local installs default to 127.0.0.1) ───
+export BRIDGE_BIND_HOST="${BRIDGE_BIND_HOST:-0.0.0.0}"
+export BRIDGE_TOKEN_PATH="${BRIDGE_TOKEN_PATH:-/data/.bridge-token}"
 
 # ─── Start the bridge ───
 exec node index.js

@@ -14,16 +14,52 @@ try {
 const app = express()
 app.use(express.json({ limit: '10mb' }))
 
-// CORS — allow the Elon frontend (localhost:9300) to call health/status directly
+// CORS — allowlist of known origins (security: never use wildcard *)
+const CORS_ALLOWLIST = new Set([
+  'http://localhost:3200',
+  'http://localhost:9300',
+  'http://127.0.0.1:3200',
+  'http://127.0.0.1:9300',
+  'https://freelabel.net',
+  'https://web.freelabel.net',
+  'https://heyiris.io',
+  'https://web.heyiris.io',
+  'https://app.heyiris.io',
+  ...(process.env.BRIDGE_CORS_ORIGINS || '').split(',').filter(Boolean)
+])
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*')
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept')
+  const origin = req.headers.origin
+  if (origin && CORS_ALLOWLIST.has(origin)) {
+    res.header('Access-Control-Allow-Origin', origin)
+    res.header('Vary', 'Origin')
+  }
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Bridge-Key, X-Mesh-Key')
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
   if (req.method === 'OPTIONS') return res.sendStatus(204)
   next()
 })
 
 const PORT = process.env.BRIDGE_PORT || 3200
+
+// ─── Auth — protect mutating endpoints with auto-generated token ───
+const { bridgeAuth, getToken, TOKEN_PATH } = require('./lib/bridge-auth')
+app.use(bridgeAuth({
+  openPaths: new Set([
+    '/health',
+    '/.well-known/security.txt',
+    '/api/config',
+    '/api/environment',
+    '/api/discover',
+    '/api/ollama/models',
+    '/daemon/health',
+    '/daemon/capacity',
+    '/daemon/profile',
+    '/daemon/queue'
+  ]),
+  openPrefixes: [
+    '/daemon/mesh/' // mesh routes use their own X-Mesh-Key auth
+  ]
+}))
 
 // Full paths to CLIs (avoids PATH issues in subprocess)
 const CLAUDE_BIN = process.env.CLAUDE_BIN || '/opt/homebrew/bin/claude'
@@ -785,6 +821,16 @@ setInterval(async () => {
 </body></html>`;
 
   res.type('html').send(html)
+})
+
+// ─── Security disclosure ─────────────────────────────────────────
+
+app.get('/.well-known/security.txt', (req, res) => {
+  res.type('text/plain').send([
+    'Contact: mailto:security@freelabel.net',
+    'Preferred-Languages: en',
+    `Expires: ${new Date(Date.now() + 365 * 86400000).toISOString()}`
+  ].join('\n'))
 })
 
 // ─── Health ───────────────────────────────────────────────────────
@@ -2811,15 +2857,13 @@ function fsAuth (req, res, next) {
   if (!bridgeConfig.fileSystem?.enabled) {
     return res.status(403).json({ error: 'File system bridge is disabled' })
   }
+  // Note: global bridgeAuth middleware already validates X-Bridge-Key.
+  // This is defense-in-depth — also check the config-level API key if set.
   const key = req.headers['x-bridge-key']
-  if (key && key === bridgeConfig.auth?.apiKey) {
-    return next()
+  if (bridgeConfig.auth?.apiKey && key !== bridgeConfig.auth.apiKey) {
+    return res.status(401).json({ error: 'Unauthorized: invalid or missing X-Bridge-Key header' })
   }
-  // Also allow if no auth key is configured
-  if (!bridgeConfig.auth?.apiKey) {
-    return next()
-  }
-  res.status(401).json({ error: 'Unauthorized: invalid or missing X-Bridge-Key header' })
+  next()
 }
 
 /**
@@ -3371,8 +3415,10 @@ function attachToExistingBridge () {
   })
 }
 
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\nCoding Agent Bridge on http://0.0.0.0:${PORT}`)
+const BIND_HOST = process.env.BRIDGE_BIND_HOST || '127.0.0.1'
+const server = app.listen(PORT, BIND_HOST, () => {
+  console.log(`\nCoding Agent Bridge on http://${BIND_HOST}:${PORT}`)
+  console.log(`Auth token: ${TOKEN_PATH} (${getToken().substring(0, 8)}...)`)
   console.log(`Providers: claude (${process.env.HOME}), opencode, ollama (${OLLAMA_HOST})`)
   console.log(`\nEndpoints:`)
   console.log(`  GET  /health`)

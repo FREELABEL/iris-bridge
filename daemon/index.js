@@ -1414,7 +1414,8 @@ LIMIT ${limit}
     }
 
     return new Promise((resolve) => {
-      this.a2aServer = app.listen(a2aPort, '0.0.0.0', () => {
+      const bindHost = process.env.BRIDGE_BIND_HOST || '127.0.0.1'
+      this.a2aServer = app.listen(a2aPort, bindHost, () => {
         console.log(`[a2a] HTTP server listening on :${a2aPort}`)
         console.log(`[a2a] Endpoints: /health /capacity /profile /pause /resume /ingest /files /processes`)
         resolve()
@@ -1472,6 +1473,9 @@ LIMIT ${limit}
     // Track immediately so heartbeat includes this task (prevents orphan race condition)
     this.pendingTaskIds.add(event.task_id)
 
+    // Pre-flight checks (singleton + browser count) run AFTER task fetch
+    // because Pusher events don't include task.type — see post-fetch checks below.
+
     const isBrowserTask = false // lock disabled — max concurrent handles throttling
 
     // Reject if at capacity
@@ -1518,6 +1522,44 @@ LIMIT ${limit}
             throw fetchErr
           }
         }
+      }
+
+      // ── Pre-flight: singleton type check (AFTER fetch, we now have task.type) ──
+      const singletonTypesPost = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan']
+      if (task && singletonTypesPost.includes(task.type)) {
+        const executorRunning = (this.executor?._runningTasks || []).map(t => t.type)
+        if (executorRunning.includes(task.type)) {
+          console.log(`[daemon] ⏭ SINGLETON: Rejecting ${task.type} (${event.task_id.substring(0, 12)}) — another ${task.type} is already running`)
+          this.pendingTaskIds.delete(event.task_id)
+          try {
+            await this.cloud.submitResult(event.task_id, {
+              status: 'failed',
+              error: `Singleton: another ${task.type} is already running on this node`
+            })
+          } catch {}
+          return
+        }
+      }
+
+      // ── Pre-flight: Chrome process count (AFTER fetch, we know if it's a browser task) ──
+      const browserTaskTypes = ['som_batch', 'discover', 'enrich_batch', 'leadgen', 'som']
+      if (task && browserTaskTypes.includes(task.type)) {
+        try {
+          const { execSync } = require('child_process')
+          // Count Playwright processes only — NEVER count Chrome Helper (that's the user's real browser)
+          const playwrightCount = parseInt(execSync("ps aux | grep -c '[p]laywright'", { encoding: 'utf-8' }).trim(), 10) || 0
+          if (playwrightCount > 6) {
+            console.log(`[daemon] ⚠️ PRE-FLIGHT: ${playwrightCount} Playwright processes — rejecting ${task.type}`)
+            this.pendingTaskIds.delete(event.task_id)
+            try {
+              await this.cloud.submitResult(event.task_id, {
+                status: 'failed',
+                error: `Too many Playwright processes (${playwrightCount})`
+              })
+            } catch {}
+            return
+          }
+        } catch {}
       }
 
       // Accept the task (ignore "already running" — task may have been auto-accepted on dispatch)
