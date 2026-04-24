@@ -377,7 +377,7 @@ function startDaemon () {
   } catch { /* ignore */ }
 
   // ─── Environment Detection ────────────────────────────────────
-  const PRODUCTION_URL = 'https://fl-iris-api-v5-mnmol.ondigitalocean.app'
+  const PRODUCTION_URL = 'https://freelabel.net'
   const LOCAL_URL = 'https://local.iris.freelabel.net'
   const isLocalFlag = args.includes('--local')
   const isProductionFlag = args.includes('--production') || args.includes('--prod')

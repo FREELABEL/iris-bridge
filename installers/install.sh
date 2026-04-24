@@ -162,7 +162,7 @@ fi
 if [ -z "${API_KEY}" ]; then
   echo ""
   echo -e "${BOLD}Enter your Node API key:${NC}"
-  echo -e "  (Get one at ${CYAN}https://app.heyiris.io/settings/compute${NC})"
+  echo -e "  (Get one at ${CYAN}https://web.heyiris.io/settings/compute${NC})"
   echo -n "  Key: "
   read -r API_KEY
 

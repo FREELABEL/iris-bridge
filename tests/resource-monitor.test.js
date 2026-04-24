@@ -50,17 +50,17 @@ describe('ResourceMonitor', () => {
       assert.equal(monitor.capacity.battery_pct, 93)
     })
 
-    it('should hibernate at 19% battery unplugged', () => {
-      const monitor = createMonitor({ onBattery: true, percent: 19 })
+    it('should hibernate at 9% battery unplugged', () => {
+      const monitor = createMonitor({ onBattery: true, percent: 9 })
       monitor._poll()
       assert.equal(monitor.capacity.level, 'hibernating')
     })
 
-    it('should NOT hibernate at exactly 20% (boundary)', () => {
-      const monitor = createMonitor({ onBattery: true, percent: 20 })
+    it('should NOT hibernate at exactly 10% (boundary)', () => {
+      const monitor = createMonitor({ onBattery: true, percent: 10 })
       monitor._poll()
       assert.notEqual(monitor.capacity.level, 'hibernating',
-        'Threshold is < 20, so 20% exactly should NOT hibernate')
+        'Threshold is < 10, so 10% exactly should NOT hibernate')
     })
 
     it('should hibernate at 1% battery unplugged', () => {
@@ -84,7 +84,7 @@ describe('ResourceMonitor', () => {
         'null percent with onBattery should NOT hibernate (cannot confirm < 20%)')
     })
 
-    it('should use CPU-based levels when on battery above 20%', () => {
+    it('should use CPU-based levels when on battery above 10%', () => {
       // 50% battery, low CPU = should be idle, not hibernating
       const monitor = createMonitor(
         { onBattery: true, percent: 50 },
@@ -150,7 +150,7 @@ describe('ResourceMonitor', () => {
       monitor.on('capacity-changed', (data) => { emitted = data })
 
       // Force a different level by changing battery mock
-      monitor._checkBattery = () => ({ onBattery: true, percent: 10 })
+      monitor._checkBattery = () => ({ onBattery: true, percent: 5 })
       monitor._poll()
 
       assert.ok(emitted, 'capacity-changed should have been emitted')
@@ -168,7 +168,7 @@ describe('ResourceMonitor', () => {
     })
 
     it('should emit on battery-to-AC transition', () => {
-      const monitor = createMonitor({ onBattery: true, percent: 10 })
+      const monitor = createMonitor({ onBattery: true, percent: 5 })
       let emitted = null
 
       // First poll: hibernating
@@ -178,7 +178,7 @@ describe('ResourceMonitor', () => {
       monitor.on('capacity-changed', (data) => { emitted = data })
 
       // Plug in AC
-      monitor._checkBattery = () => ({ onBattery: false, percent: 10 })
+      monitor._checkBattery = () => ({ onBattery: false, percent: 5 })
       monitor._poll()
 
       assert.ok(emitted)
@@ -191,7 +191,7 @@ describe('ResourceMonitor', () => {
 
   describe('canAcceptTasks()', () => {
     it('returns false when hibernating', () => {
-      const monitor = createMonitor({ onBattery: true, percent: 10 })
+      const monitor = createMonitor({ onBattery: true, percent: 5 })
       monitor._poll()
       assert.equal(monitor.capacity.level, 'hibernating')
       assert.equal(monitor.canAcceptTasks(), false)
@@ -246,7 +246,7 @@ describe('ResourceMonitor', () => {
 
     it('does not override hibernating even when CPU exceeds threshold', () => {
       const monitor = new ResourceMonitor({ intervalMs: 999999999, maxCpuThreshold: 50 })
-      monitor._checkBattery = () => ({ onBattery: true, percent: 10 })
+      monitor._checkBattery = () => ({ onBattery: true, percent: 5 })
       monitor._poll()
       assert.equal(monitor.capacity.level, 'hibernating',
         'Hibernating should win over maxCpuThreshold override')

@@ -237,7 +237,7 @@ describe('CloudClient', () => {
       const local2 = new CloudClient('http://localhost:3200', 'key')
       assert.equal(local2.isLocalDev, true)
 
-      const prod = new CloudClient('https://fl-iris-api-v5-mnmol.ondigitalocean.app', 'key')
+      const prod = new CloudClient('https://freelabel.net', 'key')
       assert.equal(prod.isLocalDev, false)
     })
   })

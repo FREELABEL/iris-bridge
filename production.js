@@ -23,7 +23,7 @@ const app = express()
 app.use(express.json({ limit: '1mb' }))
 
 const PORT = process.env.BRIDGE_PORT || 3200
-const IRIS_API_URL = process.env.IRIS_API_URL || 'https://app.heyiris.io'
+const IRIS_API_URL = process.env.IRIS_API_URL || 'https://web.heyiris.io'
 const VERSION = require('./package.json').version
 
 // ─── Messaging Bot State ────────────────────────────────────────

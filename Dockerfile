@@ -31,7 +31,7 @@ RUN mkdir -p /data/workspace /data/memory /data/skills /data/pm2
 VOLUME /data
 
 # Environment defaults (overridable at runtime)
-ENV IRIS_API_URL=https://app.heyiris.io
+ENV IRIS_API_URL=https://web.heyiris.io
 ENV PM2_HOME=/data/pm2
 ENV BRIDGE_PORT=3200
 ENV OLLAMA_HOST=http://host.docker.internal:11434

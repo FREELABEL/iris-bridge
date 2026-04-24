@@ -31,7 +31,7 @@ class IRIS {
    * @param {Object} opts
    * @param {string} [opts.apiKey] - API key (defaults to ~/.iris/sdk/.env IRIS_API_KEY)
    * @param {string} [opts.apiUrl] - fl-api base URL (defaults to https://raichu.heyiris.io)
-   * @param {string} [opts.irisApiUrl] - iris-api base URL (defaults to https://main.heyiris.io)
+   * @param {string} [opts.irisApiUrl] - iris-api base URL (defaults to https://heyiris.io)
    * @param {number} [opts.userId] - User ID (defaults to ~/.iris/sdk/.env IRIS_USER_ID)
    * @param {number} [opts.timeout] - Request timeout in ms (default: 30000)
    */
@@ -40,7 +40,7 @@ class IRIS {
 
     this.apiKey = opts.apiKey || env.IRIS_API_KEY || process.env.IRIS_API_KEY || ''
     this.apiUrl = (opts.apiUrl || env.IRIS_FL_API_URL || process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io').replace(/\/$/, '')
-    this.irisApiUrl = (opts.irisApiUrl || env.IRIS_API_URL || process.env.IRIS_API_URL || 'https://main.heyiris.io').replace(/\/$/, '')
+    this.irisApiUrl = (opts.irisApiUrl || env.IRIS_API_URL || process.env.IRIS_API_URL || 'https://heyiris.io').replace(/\/$/, '')
     this.userId = opts.userId || parseInt(env.IRIS_USER_ID || process.env.IRIS_USER_ID || '0', 10)
     this.timeout = opts.timeout || 30000
 

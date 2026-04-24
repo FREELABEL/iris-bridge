@@ -305,6 +305,86 @@ class NativeIMessageDriver extends EventEmitter {
   }
 
   /**
+   * Resolve a phone number or email to a chat GUID via chat.db lookup.
+   * Returns the chat GUID string, or null if not found.
+   */
+  async resolveHandleToGuid(handle) {
+    const digits = handle.replace(/\D/g, '')
+    const lower = handle.toLowerCase()
+
+    // Match by stripped digits (phone) or lowercase email
+    const conditions = []
+    if (digits.length >= 7) {
+      conditions.push(
+        `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(h.id, '+', ''), '-', ''), ' ', ''), '(', ''), ')', '') LIKE '%${digits}%'`
+      )
+    }
+    conditions.push(`LOWER(h.id) LIKE '%${lower.replace(/'/g, "''").replace(/%/g, '')}%'`)
+
+    const sql = `
+      SELECT c.guid AS chat_guid, c.chat_identifier, h.id AS handle_id,
+        MAX(m.date) AS last_date
+      FROM chat c
+      INNER JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
+      INNER JOIN handle h ON h.ROWID = chj.handle_id
+      LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+      LEFT JOIN message m ON m.ROWID = cmj.message_id
+      WHERE (${conditions.join(' OR ')})
+        AND c.guid LIKE 'iMessage;%'
+      GROUP BY c.guid
+      ORDER BY last_date DESC
+      LIMIT 1`
+
+    const rows = await this._runSqlite3(sql)
+    if (rows.length > 0) {
+      console.log(`[native-imessage] Resolved "${handle}" → ${rows[0].chat_guid}`)
+      return rows[0].chat_guid
+    }
+
+    // Fallback: try SMS chats too
+    const smsSql = sql.replace("AND c.guid LIKE 'iMessage;%'", "AND c.guid LIKE 'SMS;%'")
+    const smsRows = await this._runSqlite3(smsSql)
+    if (smsRows.length > 0) {
+      console.log(`[native-imessage] Resolved "${handle}" → ${smsRows[0].chat_guid} (SMS)`)
+      return smsRows[0].chat_guid
+    }
+
+    console.log(`[native-imessage] Could not resolve "${handle}" in chat.db`)
+    return null
+  }
+
+  /**
+   * Send a message by phone number or email — resolves to chat GUID first,
+   * falls back to AppleScript buddy-based send if no existing chat found.
+   */
+  async sendToHandle(handle, text, options = {}) {
+    // Try resolving via chat.db first (existing conversation)
+    const chatGuid = await this.resolveHandleToGuid(handle)
+    if (chatGuid) {
+      return this.sendMessage(chatGuid, text, options)
+    }
+
+    // Fallback: use AppleScript participant-based send (works for new conversations too)
+    console.log(`[native-imessage] No existing chat found — sending via buddy lookup for "${handle}"`)
+    const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+    const script =
+      `tell application "Messages"\n` +
+      `  set targetService to 1st account whose service type = iMessage\n` +
+      `  set targetBuddy to participant "${handle}" of targetService\n` +
+      `  send "${escaped}" to targetBuddy\n` +
+      `end tell`
+
+    await this._runOsascript(script)
+
+    const key = `${handle}:${text.slice(0, 100)}`
+    this._recentlySent.add(key)
+    setTimeout(() => this._recentlySent.delete(key), 30000)
+
+    console.log(`[native-imessage] ✓ Sent via buddy lookup (${text.length} chars)`)
+    return { ok: true, method: 'buddy_lookup' }
+  }
+
+  /**
    * Send a file attachment via AppleScript
    */
   async sendAttachment(chatGuid, attachmentPath, text = '', options = {}) {

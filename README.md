@@ -126,7 +126,7 @@ Reads config from `~/.iris/config.json`:
 ```json
 {
   "node_api_key": "node_live_xxx",
-  "api_url": "https://main.heyiris.io",
+  "api_url": "https://heyiris.io",
   "user_id": 193
 }
 ```
