@@ -180,20 +180,24 @@ async function somPreflightCheck (boardId, strategy) {
       console.log(`${prefix}   Never contacted: ${neverContacted}`)
     }
 
-    // Determine eligibility: are there leads ready for ANY step?
-    const eligible = nextAction?.ready || neverContacted
-    if (eligible === 0 && neverContacted === 0) {
-      const fullyDone = summary.fully_completed || 0
+    // Skip decision: Playwright's default mode is filter=new — it only contacts leads
+    // that have NO outreach steps at all (.fa-paper-plane icon absent in UI).
+    // So "never_contacted" is the correct signal for the skip decision.
+    // The funnel steps (DM Invite → Follow Up → etc.) are for visibility/dashboards,
+    // but the daemon should skip when there are NO new leads to contact.
+    if (neverContacted === 0) {
+      // Log what's left in the pipeline for visibility
+      const stepSummary = steps.filter(s => s.pending > 0).map(s => `${s.title}: ${s.pending} pending`).join(', ')
       return {
         eligible: 0, total, skip: true,
-        reason: `All ${total} leads fully completed (${steps.length} steps, ${fullyDone} finished all)`,
-        nextStep: null,
+        reason: `All ${total} leads already contacted` + (stepSummary ? ` (follow-up pipeline: ${stepSummary})` : ''),
+        nextStep: nextAction,
       }
     }
 
     return {
-      eligible, total, skip: false,
-      reason: nextAction?.action || `${eligible} leads ready`,
+      eligible: neverContacted, total, skip: false,
+      reason: `${neverContacted} new leads to contact` + (nextAction ? ` (next: ${nextAction.action})` : ''),
       nextStep: nextAction,
     }
   } catch (err) {
