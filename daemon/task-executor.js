@@ -124,6 +124,7 @@ function loadProjectEnv () {
 // Auto-detect freelabel project root (looks for som:creators npm script)
 /**
  * SOM Preflight — check if a campaign has eligible leads BEFORE launching Chromium.
+ * Uses /leads/stats endpoint with optional strategy filter for a single lightweight API call.
  * Returns { eligible: number, total: number, skip: boolean, reason: string }
  */
 async function somPreflightCheck (boardId, strategy) {
@@ -132,45 +133,50 @@ async function somPreflightCheck (boardId, strategy) {
   const prefix = '[preflight]'
 
   try {
-    const url = `${apiBase}/api/v1/leads?bloq_id=${boardId}&per_page=1&page=1`
+    // Use /leads/stats for lightweight aggregate counts (no lead data, no pagination)
+    let url = `${apiBase}/api/v1/leads/stats?bloq_id=${boardId}`
+    if (strategy) url += `&strategy=${encodeURIComponent(strategy)}`
+
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
       signal: AbortSignal.timeout(10000),
     })
 
     if (!res.ok) {
-      console.log(`${prefix} ⚠️  API returned ${res.status} — skipping preflight, will run anyway`)
+      console.log(`${prefix} ⚠️  Stats API returned ${res.status} — will run anyway`)
       return { eligible: -1, total: -1, skip: false, reason: 'api_error' }
     }
 
-    const data = await res.json()
-    const total = data.total || 0
-    const leads = data.data || []
+    const json = await res.json()
+    const stats = json.data || {}
+    const total = stats.total_leads || 0
 
     if (total === 0) {
       return { eligible: 0, total: 0, skip: true, reason: `Board ${boardId} has 0 leads` }
     }
 
-    // Check the first page for leads that still need outreach
-    // A lead needs outreach if it doesn't have the strategy's outreach step completed
-    // Quick heuristic: check if ALL leads on page 1 have outreach_status = 'completed'
-    const page1Url = `${apiBase}/api/v1/leads?bloq_id=${boardId}&per_page=100&page=1&outreach_status=pending`
-    const page1Res = await fetch(page1Url, {
-      headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
-      signal: AbortSignal.timeout(10000),
-    })
+    // Use strategy-filtered stats if available, else generic engagement stats
+    const outreachFilter = stats.outreach_filter
+    const engagement = stats.engagement || {}
 
-    if (page1Res.ok) {
-      const page1Data = await page1Res.json()
-      const pending = page1Data.total || 0
-      if (pending === 0) {
-        return { eligible: 0, total, skip: true, reason: `All ${total} leads have outreach completed` }
+    if (outreachFilter) {
+      // Strategy-specific: only count leads not contacted by THIS strategy
+      const eligible = outreachFilter.eligible || 0
+      if (eligible === 0) {
+        return { eligible: 0, total, skip: true, reason: `All ${total} leads completed "${strategy}"` }
       }
-      return { eligible: pending, total, skip: false, reason: `${pending} leads pending` }
+      return { eligible, total, skip: false, reason: `${eligible} leads eligible for "${strategy}"` }
     }
 
-    // If the filtered endpoint doesn't work, fall back to running
-    return { eligible: -1, total, skip: false, reason: 'filter_not_supported' }
+    // Generic: count leads never contacted + those with pending steps
+    const neverContacted = engagement.never_contacted ?? total
+    const pending = engagement.outreach_pending ?? 0
+    const eligible = neverContacted + pending
+
+    if (eligible === 0) {
+      return { eligible: 0, total, skip: true, reason: `All ${total} leads have outreach completed` }
+    }
+    return { eligible, total, skip: false, reason: `${eligible} leads eligible (${neverContacted} new, ${pending} in progress)` }
   } catch (err) {
     console.log(`${prefix} ⚠️  Preflight failed: ${err.message} — will run anyway`)
     return { eligible: -1, total: -1, skip: false, reason: 'preflight_error' }
