@@ -124,8 +124,8 @@ function loadProjectEnv () {
 // Auto-detect freelabel project root (looks for som:creators npm script)
 /**
  * SOM Preflight — check if a campaign has eligible leads BEFORE launching Chromium.
- * Uses /leads/stats endpoint with optional strategy filter for a single lightweight API call.
- * Returns { eligible: number, total: number, skip: boolean, reason: string }
+ * Uses /leads/outreach-funnel for step-by-step breakdown.
+ * Returns { eligible: number, total: number, skip: boolean, reason: string, nextStep: object|null }
  */
 async function somPreflightCheck (boardId, strategy) {
   const apiBase = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io'
@@ -133,8 +133,7 @@ async function somPreflightCheck (boardId, strategy) {
   const prefix = '[preflight]'
 
   try {
-    // Use /leads/stats for lightweight aggregate counts (no lead data, no pagination)
-    let url = `${apiBase}/api/v1/leads/stats?bloq_id=${boardId}`
+    let url = `${apiBase}/api/v1/leads/outreach-funnel?bloq_id=${boardId}`
     if (strategy) url += `&strategy=${encodeURIComponent(strategy)}`
 
     const res = await fetch(url, {
@@ -143,40 +142,60 @@ async function somPreflightCheck (boardId, strategy) {
     })
 
     if (!res.ok) {
-      console.log(`${prefix} ⚠️  Stats API returned ${res.status} — will run anyway`)
-      return { eligible: -1, total: -1, skip: false, reason: 'api_error' }
+      // Fallback to /leads/stats if funnel endpoint not available
+      console.log(`${prefix} ⚠️  Funnel API returned ${res.status} — falling back to stats`)
+      const statsUrl = `${apiBase}/api/v1/leads/stats?bloq_id=${boardId}`
+      const statsRes = await fetch(statsUrl, {
+        headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!statsRes.ok) return { eligible: -1, total: -1, skip: false, reason: 'api_error' }
+      const statsJson = await statsRes.json()
+      const eng = statsJson.data?.engagement || {}
+      const eligible = (eng.never_contacted || 0) + (eng.outreach_pending || 0)
+      const total = statsJson.data?.total_leads || 0
+      if (eligible === 0) return { eligible: 0, total, skip: true, reason: `All ${total} leads completed` }
+      return { eligible, total, skip: false, reason: `${eligible} eligible (fallback)` }
     }
 
     const json = await res.json()
-    const stats = json.data || {}
-    const total = stats.total_leads || 0
+    const data = json.data || {}
+    const total = data.total_leads || 0
+    const neverContacted = data.never_contacted || 0
+    const steps = data.steps || []
+    const nextAction = data.next_action
+    const summary = data.summary || {}
 
     if (total === 0) {
       return { eligible: 0, total: 0, skip: true, reason: `Board ${boardId} has 0 leads` }
     }
 
-    // Use strategy-filtered stats if available, else generic engagement stats
-    const outreachFilter = stats.outreach_filter
-    const engagement = stats.engagement || {}
-
-    if (outreachFilter) {
-      // Strategy-specific: only count leads not contacted by THIS strategy
-      const eligible = outreachFilter.eligible || 0
-      if (eligible === 0) {
-        return { eligible: 0, total, skip: true, reason: `All ${total} leads completed "${strategy}"` }
+    // Log the funnel for visibility
+    if (steps.length > 0) {
+      for (const s of steps) {
+        console.log(`${prefix}   Step ${s.step} "${s.title}": ${s.completed}/${s.eligible} (${s.conversion}%)`)
       }
-      return { eligible, total, skip: false, reason: `${eligible} leads eligible for "${strategy}"` }
+    }
+    if (neverContacted > 0) {
+      console.log(`${prefix}   Never contacted: ${neverContacted}`)
     }
 
-    // Generic: count leads never contacted + those with pending steps
-    const neverContacted = engagement.never_contacted ?? total
-    const pending = engagement.outreach_pending ?? 0
-    const eligible = neverContacted + pending
-
-    if (eligible === 0) {
-      return { eligible: 0, total, skip: true, reason: `All ${total} leads have outreach completed` }
+    // Determine eligibility: are there leads ready for ANY step?
+    const eligible = nextAction?.ready || neverContacted
+    if (eligible === 0 && neverContacted === 0) {
+      const fullyDone = summary.fully_completed || 0
+      return {
+        eligible: 0, total, skip: true,
+        reason: `All ${total} leads fully completed (${steps.length} steps, ${fullyDone} finished all)`,
+        nextStep: null,
+      }
     }
-    return { eligible, total, skip: false, reason: `${eligible} leads eligible (${neverContacted} new, ${pending} in progress)` }
+
+    return {
+      eligible, total, skip: false,
+      reason: nextAction?.action || `${eligible} leads ready`,
+      nextStep: nextAction,
+    }
   } catch (err) {
     console.log(`${prefix} ⚠️  Preflight failed: ${err.message} — will run anyway`)
     return { eligible: -1, total: -1, skip: false, reason: 'preflight_error' }
