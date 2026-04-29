@@ -1669,7 +1669,7 @@ LIMIT ${limit}
       }
 
       // ── Pre-flight: singleton type check (AFTER fetch, we now have task.type) ──
-      const singletonTypesPost = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan']
+      const singletonTypesPost = ['som_batch', 'discover', 'enrich_batch', 'inbox_scan', 'clip_cutter']
       if (task && singletonTypesPost.includes(task.type)) {
         const executorRunning = (this.executor?._runningTasks || []).map(t => t.type)
         if (executorRunning.includes(task.type)) {
@@ -1686,23 +1686,33 @@ LIMIT ${limit}
       }
 
       // ── Pre-flight: Chrome process count (AFTER fetch, we know if it's a browser task) ──
+      // If too many Playwright processes, WAIT (up to 5 min) instead of hard-failing.
       const browserTaskTypes = ['som_batch', 'discover', 'enrich_batch', 'leadgen', 'som']
       if (task && browserTaskTypes.includes(task.type)) {
+        const MAX_PREFLIGHT_WAIT = 300 // 5 minutes
+        const POLL_INTERVAL = 10 // check every 10s
+        let waited = 0
+        let playwrightCount = 0
         try {
           const { execSync } = require('child_process')
-          // Count Playwright processes only — NEVER count Chrome Helper (that's the user's real browser)
-          const playwrightCount = parseInt(execSync("ps aux | grep -c '[p]laywright'", { encoding: 'utf-8' }).trim(), 10) || 0
+          for (; waited < MAX_PREFLIGHT_WAIT; waited += POLL_INTERVAL) {
+            playwrightCount = parseInt(execSync("ps aux | grep -c '[p]laywright'", { encoding: 'utf-8' }).trim(), 10) || 0
+            if (playwrightCount <= 6) break
+            if (waited === 0) console.log(`[daemon] ⏳ PRE-FLIGHT: ${playwrightCount} Playwright processes — waiting for capacity (${task.type})`)
+            await new Promise(r => setTimeout(r, POLL_INTERVAL * 1000))
+          }
           if (playwrightCount > 6) {
-            console.log(`[daemon] ⚠️ PRE-FLIGHT: ${playwrightCount} Playwright processes — rejecting ${task.type}`)
+            console.log(`[daemon] ⚠️ PRE-FLIGHT: Still ${playwrightCount} Playwright processes after ${MAX_PREFLIGHT_WAIT}s — rejecting ${task.type}`)
             this.pendingTaskIds.delete(event.task_id)
             try {
               await this.cloud.submitResult(event.task_id, {
                 status: 'failed',
-                error: `Too many Playwright processes (${playwrightCount})`
+                error: `Too many Playwright processes (${playwrightCount}) after ${MAX_PREFLIGHT_WAIT}s wait`
               })
             } catch {}
             return
           }
+          if (waited > 0) console.log(`[daemon] ✓ PRE-FLIGHT: Playwright cleared (${playwrightCount} processes) after ${waited}s — proceeding with ${task.type}`)
         } catch {}
       }
 

@@ -1346,6 +1346,43 @@ class TaskExecutor {
           break
         }
 
+        case 'clip_cutter': {
+          // Pick a recent unclipped video and dispatch a clip job to Instagram
+          // prompt format: "[key=value ...]" e.g. "brand=discover" or "dry=1"
+          // Uses the artisan command clips:cut-scheduled which handles:
+          //   - Querying latest 20 videos from tv table
+          //   - Picking first unclipped one (clipped_at IS NULL)
+          //   - Dispatching ProcessVideoClip job with brand caption (three-layer closer)
+          //   - Publishing to Instagram as Reel via Buffer
+          const clipParams = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
+          const clipBrand = clipParams.find(p => p.startsWith('brand='))?.split('=')[1] || 'discover'
+          const clipDry = clipParams.find(p => p.startsWith('dry='))?.split('=')[1] === '1'
+
+          if (!this.flApiPath) {
+            reject(new Error('fl-api not found. Set FL_API_PATH env var to the Laravel root.'))
+            return
+          }
+
+          if (this.dockerMode === null) {
+            this.dockerMode = isDockerMode()
+          }
+
+          const clipArtisanArgs = [`clips:cut-scheduled`, `--brand=${clipBrand}`]
+          if (clipDry) clipArtisanArgs.push('--dry-run')
+
+          if (this.dockerMode) {
+            const dockerRoot = path.resolve(this.flApiPath, '..')
+            cmd = 'docker'
+            args = ['compose', '-f', path.join(dockerRoot, 'docker-compose.yml'), 'exec', '-T', 'api', 'php', 'artisan', ...clipArtisanArgs]
+            workspace.projectDir = dockerRoot
+          } else {
+            cmd = 'php'
+            args = ['artisan', ...clipArtisanArgs]
+            workspace.projectDir = this.flApiPath
+          }
+          break
+        }
+
         case 'inbox_scan': {
           // Scan IG inbox for replies across all active SOM accounts
           // prompt format: "all [since=4h] [wb=1] [dry=1]" or "{account} [since=24h] [wb=1]"
@@ -1444,10 +1481,10 @@ class TaskExecutor {
             return
           }
 
-          const dpBrand = dpParams.brand || 'beatbox'
+          const dpBrand = dpParams.brand || 'discover'
           const dpStart = dpParams.start || '0:10'
           const dpDuration = dpParams.duration || '90'
-          const dpPlatforms = (dpParams.platforms || 'instagram,tiktok').split(',')
+          const dpPlatforms = (dpParams.platforms || 'instagram,tiktok,x').split(',')
 
           // Call iris-api execute-direct endpoint directly via curl
           // This bypasses the SDK CLI and its .env config issues
