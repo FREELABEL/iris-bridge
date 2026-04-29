@@ -116,8 +116,11 @@ class IMessageChannel extends EventEmitter {
         return
       }
 
-      // Forward to IRIS API
+      // Forward to IRIS API (agent processing)
       await this.forwardToAPI(normalized)
+
+      // Pulse: write to unified comms cache (lead_comms) for AI analysis
+      await this.writeToCommsCache(normalized)
 
       this.messageCount++
     } catch (err) {
@@ -192,6 +195,54 @@ class IMessageChannel extends EventEmitter {
       console.error(`[imessage] Forward error: ${err.message}`)
       // Don't auto-reply on error — it can create infinite loops
       // when the driver picks up its own outbound error messages
+    }
+  }
+
+  /**
+   * Write message to fl-api's lead_comms table (Pulse unified comms cache).
+   * Non-blocking — failures don't affect message processing.
+   */
+  async writeToCommsCache(event) {
+    const flApiUrl = process.env.FL_API_URL || 'https://raichu.heyiris.io'
+    const flApiToken = process.env.HEYIRIS_TOKEN || process.env.FL_RAICHU_API_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd'
+
+    try {
+      const payload = {
+        channel: 'imessage',
+        direction: event.is_from_me ? 'outbound' : 'inbound',
+        from_identifier: event.sender_id,
+        to_identifiers: event.is_from_me ? [event.conversation_id] : null,
+        subject: event.is_group ? (event.group_name || 'Group') : 'DM',
+        body: event.text,
+        sent_at: event.timestamp || new Date().toISOString(),
+        metadata: {
+          conversation_id: event.conversation_id,
+          sender_name: event.sender_name,
+          is_group: event.is_group,
+          group_name: event.group_name,
+          message_id: event.message_id,
+        },
+      }
+
+      const res = await fetch(`${flApiUrl}/api/v1/atlas/comms/ingest`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${flApiToken}`,
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(5000),
+      })
+
+      if (!res.ok) {
+        // Silent fail — comms cache is nice-to-have, not critical
+        const text = await res.text().catch(() => '')
+        if (process.env.DEBUG) console.log(`[pulse] Comms cache write failed: HTTP ${res.status} ${text.slice(0, 100)}`)
+      }
+    } catch {
+      // Non-blocking — don't log unless debugging
+      if (process.env.DEBUG) console.log('[pulse] Comms cache write failed (non-blocking)')
     }
   }
 
