@@ -811,23 +811,40 @@ class TaskExecutor {
           fs.writeFileSync(path.join(workspace.dir, 'playwright.config.ts'), pwConfig, 'utf-8')
 
           // Resolve a hosting project that has @playwright/test installed.
-          // Tries IRIS_PLAYWRIGHT_HOST, then freelabel root, then iris-code root.
-          let hostDir = process.env.IRIS_PLAYWRIGHT_HOST
-            || path.resolve(os.homedir(), 'Sites/freelabel')
-            || path.resolve(os.homedir(), 'Sites/freelabel/iris-code')
-          const hostPwPkg = path.join(hostDir, 'node_modules/@playwright/test/package.json')
-          if (!fs.existsSync(hostPwPkg)) {
-            hostDir = null
+          // Then symlink its node_modules into the workspace so Node's module
+          // resolution (which walks up from the spec file's location) can find
+          // @playwright/test without needing a per-task npm install.
+          const candidateHosts = [
+            process.env.IRIS_PLAYWRIGHT_HOST,
+            path.resolve(os.homedir(), 'Sites/freelabel'),
+            path.resolve(os.homedir(), 'Sites/freelabel/iris-code'),
+          ].filter(Boolean)
+          let hostDir = null
+          for (const cand of candidateHosts) {
+            if (fs.existsSync(path.join(cand, 'node_modules/@playwright/test/package.json'))) {
+              hostDir = cand
+              break
+            }
           }
 
           if (hostDir) {
-            // Run from the host project (which has playwright installed) but pointing at our spec.
-            // Uses --config to load OUR generated playwright.config.ts so timeout etc. apply.
+            // Symlink host's node_modules into workspace — Node resolves @playwright/test
+            // from the spec file's directory, walks up, finds workspace/node_modules first.
+            const wsNodeModules = path.join(workspace.dir, 'node_modules')
+            try {
+              if (!fs.existsSync(wsNodeModules)) {
+                fs.symlinkSync(path.join(hostDir, 'node_modules'), wsNodeModules, 'dir')
+              }
+            } catch (e) {
+              console.log(`[executor] symlink failed (${e.message}), falling back to NODE_PATH`)
+            }
             cmd = 'npx'
-            args = ['playwright', 'test', scriptPath, '--config', path.join(workspace.dir, 'playwright.config.ts'), '--headed', `--timeout=${timeoutMs}`]
-            workspace.projectDir = hostDir
+            args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`]
+            workspace.projectDir = workspace.dir
+            // Belt-and-suspenders: also set NODE_PATH so module resolution can find it
+            workspace.env = { ...(workspace.env || {}), NODE_PATH: path.join(hostDir, 'node_modules') }
           } else {
-            // Fallback: install @playwright/test into the workspace first
+            // Fallback: install @playwright/test into the workspace
             console.log('[executor] custom_playwright: no host project found, installing @playwright/test in workspace...')
             await new Promise((resolve, reject) => {
               const p = spawn('npm', ['install', '--no-save', '@playwright/test@latest'], { cwd: workspace.dir, stdio: 'inherit' })
@@ -2211,6 +2228,7 @@ exit 1
           TASK_TYPE: task.type,
           WORKSPACE_DIR: workspace.dir,
           PROJECT_DIR: workspace.projectDir,
+          ...(workspace.env || {}),
           ...(task.config?.env_vars || {})
         },
         stdio: ['pipe', 'pipe', 'pipe']
