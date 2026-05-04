@@ -794,6 +794,30 @@ class TaskExecutor {
           args = ['-c', task.prompt]
           break
 
+        case 'comms_sync': {
+          // Pulse-dispatched silent comms sync. Server queues these every 15 min
+          // for users with stale lead_comms; bridge picks up and runs the iris
+          // CLI sync-comms command which fetches iMessage/Mail/Gmail and POSTs
+          // to /atlas/comms/ingest. Score updates on the next pulse:tick.
+          //
+          // task.config = { lead_ids: [...], days: 30, limit: 50 }
+          const cfg = task.config || {}
+          const leadIds = Array.isArray(cfg.lead_ids) ? cfg.lead_ids : []
+          if (leadIds.length === 0) {
+            reject(new Error('comms_sync: no lead_ids in config'))
+            return
+          }
+          const days = cfg.days || 30
+          const limit = cfg.limit || 50
+
+          // Use the iris binary on PATH; auth comes from ~/.iris/sdk/.env
+          // (FL_API_TOKEN + IRIS_USER_ID are read by the CLI).
+          cmd = 'iris'
+          args = ['leads', 'sync-comms', ...leadIds.map(String), '--days', String(days), '--limit', String(limit)]
+          console.log(`[executor] comms_sync: ${leadIds.length} lead(s), days=${days}`)
+          break
+        }
+
         case 'custom_playwright': {
           // Execute a user-provided Playwright script in an isolated workspace.
           // script_content comes via task.config.script_content (from template or hiveRunScript tool).
