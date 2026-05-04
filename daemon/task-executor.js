@@ -810,11 +810,14 @@ class TaskExecutor {
           const days = cfg.days || 30
           const limit = cfg.limit || 50
 
-          // Use the iris binary on PATH; auth comes from ~/.iris/sdk/.env
-          // (FL_API_TOKEN + IRIS_USER_ID are read by the CLI).
-          cmd = 'iris'
+          // Use absolute path to iris — daemon's PATH (set by launchd/systemd)
+          // doesn't include ~/.iris/bin where the binary lives. Falls back to
+          // bare 'iris' if the absolute path doesn't exist (some installs).
+          // Auth comes from ~/.iris/sdk/.env (FL_API_TOKEN + IRIS_USER_ID).
+          const irisAbsPath = path.join(os.homedir(), '.iris', 'bin', 'iris')
+          cmd = fs.existsSync(irisAbsPath) ? irisAbsPath : 'iris'
           args = ['leads', 'sync-comms', ...leadIds.map(String), '--days', String(days), '--limit', String(limit)]
-          console.log(`[executor] comms_sync: ${leadIds.length} lead(s), days=${days}`)
+          console.log(`[executor] comms_sync: ${leadIds.length} lead(s), days=${days}, cmd=${cmd}`)
           break
         }
 
@@ -1026,21 +1029,101 @@ class TaskExecutor {
         }
 
         case 'leadgen': {
-          // prompt format: "{campaign} [key=value ...]"
-          // e.g. "creators limit=30 enrich=1 mode=followers min_followers=1000"
-          const leadgenParts = task.prompt.trim().split(/\s+/)
-          const leadgenCampaign = leadgenParts[0] // creators | courses | beatbox | mayo | sophe
-          const leadgenExtraArgs = leadgenParts.slice(1)
+          // SDK-only leadgen — no Freelabel checkout, no IG sessions, no Playwright.
+          // Calls fl-api /leads endpoints directly with the user's own FL_API_TOKEN.
+          // Anyone running the daemon can use this; their token = their leads.
+          //
+          // Prompt format: "{action} [key=value ...]"
+          //   enrich bloq_id=38 limit=20    — enrich N leads in a bloq via quick-enrich-ig + /enrich
+          //   create handle=@foo bloq_id=38 — create + enrich one lead (set enrich=0 to skip)
+          const lgParts = task.prompt.trim().split(/\s+/)
+          const lgAction = lgParts[0] || 'enrich'
+          const lgParams = Object.fromEntries(
+            lgParts.slice(1).map(kv => {
+              const i = kv.indexOf('=')
+              return i < 0 ? [kv, '1'] : [kv.slice(0, i), kv.slice(i + 1)]
+            })
+          )
 
-          const leadgenRoot = this.freelabelPath || findFreelabelPath()
-          if (!leadgenRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
+          // Resolve token (env first, then ~/.iris/sdk/.env — same pattern as Remotion chain)
+          let lgToken = process.env.FL_API_TOKEN
+          if (!lgToken) {
+            try {
+              const sdkEnv = path.join(os.homedir(), '.iris', 'sdk', '.env')
+              if (fs.existsSync(sdkEnv)) {
+                const m = fs.readFileSync(sdkEnv, 'utf-8').match(/^FL_API_TOKEN=(.+)$/m)
+                if (m) lgToken = m[1].trim()
+              }
+            } catch { /* ignore */ }
+          }
+          if (!lgToken) {
+            reject(new Error('leadgen: no FL_API_TOKEN found (set env var or ~/.iris/sdk/.env)'))
             return
           }
 
-          cmd = 'npm'
-          args = ['run', `leadgen:${leadgenCampaign}`, '--', ...leadgenExtraArgs]
-          workspace.projectDir = leadgenRoot
+          const lgApiBase = process.env.FL_API_URL || 'https://raichu.heyiris.io'
+
+          const lgScript = `
+const TOKEN = ${JSON.stringify(lgToken)};
+const API = ${JSON.stringify(lgApiBase)};
+const ACTION = ${JSON.stringify(lgAction)};
+const PARAMS = ${JSON.stringify(lgParams)};
+
+async function call(method, p, body) {
+  const res = await fetch(API + p, {
+    method,
+    headers: { Authorization: 'Bearer ' + TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const text = await res.text();
+  let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) throw new Error(method + ' ' + p + ' -> ' + res.status + ': ' + text.slice(0, 200));
+  return json;
+}
+
+(async () => {
+  if (ACTION === 'create') {
+    if (!PARAMS.handle || !PARAMS.bloq_id) throw new Error('create requires handle= and bloq_id=');
+    const created = await call('POST', '/api/v1/leads', { handle: PARAMS.handle, bloq_id: Number(PARAMS.bloq_id) });
+    const id = created.id || created.data?.id;
+    console.log('[leadgen] created lead ' + id + ' (' + PARAMS.handle + ')');
+    if (id && PARAMS.enrich !== '0') {
+      try { await call('POST', '/api/v1/leads/' + id + '/quick-enrich-ig', {}); console.log('[leadgen] quick-enriched ' + id); } catch (e) { console.log('[leadgen] quick-enrich failed: ' + e.message); }
+      try { await call('POST', '/api/v1/leads/' + id + '/enrich', {}); console.log('[leadgen] full-enriched ' + id); } catch (e) { console.log('[leadgen] enrich failed: ' + e.message); }
+    }
+    console.log(JSON.stringify({ action: 'create', lead_id: id }, null, 2));
+    return;
+  }
+
+  if (ACTION === 'enrich') {
+    if (!PARAMS.bloq_id) throw new Error('enrich requires bloq_id=');
+    const limit = Number(PARAMS.limit || 20);
+    const list = await call('GET', '/api/v1/leads?bloq_id=' + PARAMS.bloq_id + '&per_page=' + limit, null);
+    const leads = list.data || list.leads || (Array.isArray(list) ? list : []);
+    console.log('[leadgen] fetched ' + leads.length + ' lead(s) from bloq ' + PARAMS.bloq_id);
+    let ok = 0, fail = 0;
+    for (const lead of leads) {
+      try {
+        await call('POST', '/api/v1/leads/' + lead.id + '/quick-enrich-ig', {});
+        await call('POST', '/api/v1/leads/' + lead.id + '/enrich', {});
+        console.log('[leadgen] enriched ' + lead.id + ' (' + (lead.handle || lead.name || '') + ')');
+        ok++;
+      } catch (e) {
+        console.log('[leadgen] FAIL ' + lead.id + ': ' + e.message);
+        fail++;
+      }
+    }
+    console.log(JSON.stringify({ action: 'enrich', bloq_id: PARAMS.bloq_id, total: leads.length, ok, fail }, null, 2));
+    return;
+  }
+
+  throw new Error('unknown action: ' + ACTION + ' (expected: create | enrich)');
+})().catch(err => { console.error('[leadgen] ERROR: ' + err.message); process.exit(1); });
+`
+          const lgScriptPath = path.join(workspace.dir, 'leadgen-task.js')
+          fs.writeFileSync(lgScriptPath, lgScript, 'utf-8')
+          cmd = 'node'
+          args = [lgScriptPath]
           break
         }
 
