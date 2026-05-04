@@ -121,164 +121,7 @@ function loadProjectEnv () {
   return _projectEnvCache
 }
 
-// ── DB-driven campaign config (Phase 2) ──────────────────────────────────
-// Fetches campaign configs from iris-api /api/v1/campaign-templates/daemon-configs
-// Falls back to som-config.js if API is unavailable or returns empty.
-// Cached for 5 minutes to avoid hammering the API on every task dispatch.
-let _dbCampaignCache = null
-let _dbCampaignCacheTs = 0
-const DB_CAMPAIGN_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
-
-async function fetchDbCampaignConfigs () {
-  const now = Date.now()
-  if (_dbCampaignCache && (now - _dbCampaignCacheTs) < DB_CAMPAIGN_CACHE_TTL) {
-    return _dbCampaignCache
-  }
-
-  const apiBase = process.env.IRIS_API_URL || process.env.IRIS_API_BASE_URL || 'https://freelabel.net'
-  const apiToken = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd'
-  const userId = process.env.HEYIRIS_USER_ID || '1'
-
-  try {
-    const url = `${apiBase}/api/v1/campaign-templates/daemon-configs?user_id=${userId}`
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
-      signal: AbortSignal.timeout(8000),
-    })
-
-    if (!res.ok) {
-      console.log(`[executor] DB campaign config API returned ${res.status} — falling back to som-config.js`)
-      return null
-    }
-
-    const data = await res.json()
-    if (data.configs && Object.keys(data.configs).length > 0) {
-      _dbCampaignCache = data
-      _dbCampaignCacheTs = now
-      console.log(`[executor] Loaded ${Object.keys(data.configs).length} campaign configs from DB (source: ${data.source})`)
-      return data
-    }
-
-    return null
-  } catch (err) {
-    console.log(`[executor] DB campaign config fetch failed: ${err.message} — falling back to som-config.js`)
-    return null
-  }
-}
-
-/**
- * Get campaign configs — DB-first, som-config.js fallback.
- * Returns { configs: { id: { boardId, strategy, igAccount } }, activeAccounts: [...] }
- */
-async function getCampaignConfigs (freelabelRoot) {
-  // Try DB first
-  const dbData = await fetchDbCampaignConfigs()
-  if (dbData?.configs && Object.keys(dbData.configs).length > 0) {
-    return {
-      configs: dbData.configs,
-      activeAccounts: dbData.active_accounts || [],
-      source: 'database',
-    }
-  }
-
-  // Fallback to som-config.js
-  try {
-    const somConfig = require(path.join(freelabelRoot, 'tests/e2e/som-config.js'))
-    return {
-      configs: somConfig.getDaemonConfigs(),
-      activeAccounts: Object.values(somConfig.getActiveAccounts()),
-      source: 'som-config.js',
-    }
-  } catch {
-    return { configs: {}, activeAccounts: [], source: 'none' }
-  }
-}
-
 // Auto-detect freelabel project root (looks for som:creators npm script)
-/**
- * SOM Preflight — check if a campaign has eligible leads BEFORE launching Chromium.
- * Uses /leads/outreach-funnel for step-by-step breakdown.
- * Returns { eligible: number, total: number, skip: boolean, reason: string, nextStep: object|null }
- */
-async function somPreflightCheck (boardId, strategy) {
-  const apiBase = process.env.IRIS_FL_API_URL || 'https://raichu.heyiris.io'
-  const apiToken = process.env.HEYIRIS_TOKEN || 'ca54cd87e7046098eee99de3b9c98cfd'
-  const prefix = '[preflight]'
-
-  try {
-    let url = `${apiBase}/api/v1/leads/outreach-funnel?bloq_id=${boardId}`
-    if (strategy) url += `&strategy=${encodeURIComponent(strategy)}`
-
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
-      signal: AbortSignal.timeout(10000),
-    })
-
-    if (!res.ok) {
-      // Fallback to /leads/stats if funnel endpoint not available
-      console.log(`${prefix} ⚠️  Funnel API returned ${res.status} — falling back to stats`)
-      const statsUrl = `${apiBase}/api/v1/leads/stats?bloq_id=${boardId}`
-      const statsRes = await fetch(statsUrl, {
-        headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
-        signal: AbortSignal.timeout(10000),
-      })
-      if (!statsRes.ok) return { eligible: -1, total: -1, skip: false, reason: 'api_error' }
-      const statsJson = await statsRes.json()
-      const eng = statsJson.data?.engagement || {}
-      const eligible = (eng.never_contacted || 0) + (eng.outreach_pending || 0)
-      const total = statsJson.data?.total_leads || 0
-      if (eligible === 0) return { eligible: 0, total, skip: true, reason: `All ${total} leads completed` }
-      return { eligible, total, skip: false, reason: `${eligible} eligible (fallback)` }
-    }
-
-    const json = await res.json()
-    const data = json.data || {}
-    const total = data.total_leads || 0
-    const neverContacted = data.never_contacted || 0
-    const steps = data.steps || []
-    const nextAction = data.next_action
-    const summary = data.summary || {}
-
-    if (total === 0) {
-      return { eligible: 0, total: 0, skip: true, reason: `Board ${boardId} has 0 leads` }
-    }
-
-    // Log the funnel for visibility
-    if (steps.length > 0) {
-      for (const s of steps) {
-        console.log(`${prefix}   Step ${s.step} "${s.title}": ${s.completed}/${s.eligible} (${s.conversion}%)`)
-      }
-    }
-    if (neverContacted > 0) {
-      console.log(`${prefix}   Never contacted: ${neverContacted}`)
-    }
-
-    // Skip decision: Playwright's default mode is filter=new — it only contacts leads
-    // that have NO outreach steps at all (.fa-paper-plane icon absent in UI).
-    // So "never_contacted" is the correct signal for the skip decision.
-    // The funnel steps (DM Invite → Follow Up → etc.) are for visibility/dashboards,
-    // but the daemon should skip when there are NO new leads to contact.
-    if (neverContacted === 0) {
-      // Log what's left in the pipeline for visibility
-      const stepSummary = steps.filter(s => s.pending > 0).map(s => `${s.title}: ${s.pending} pending`).join(', ')
-      return {
-        eligible: 0, total, skip: true,
-        reason: `All ${total} leads already contacted` + (stepSummary ? ` (follow-up pipeline: ${stepSummary})` : ''),
-        nextStep: nextAction,
-      }
-    }
-
-    return {
-      eligible: neverContacted, total, skip: false,
-      reason: `${neverContacted} new leads to contact` + (nextAction ? ` (next: ${nextAction.action})` : ''),
-      nextStep: nextAction,
-    }
-  } catch (err) {
-    console.log(`${prefix} ⚠️  Preflight failed: ${err.message} — will run anyway`)
-    return { eligible: -1, total: -1, skip: false, reason: 'preflight_error' }
-  }
-}
-
 function findFreelabelPath () {
   // 1. Explicit env var
   if (process.env.FREELABEL_PATH) {
@@ -626,19 +469,10 @@ class TaskExecutor {
         ? '... (truncated) ...\n' + fullOutput.slice(-MAX_OUTPUT)
         : fullOutput
 
-      // For browser tasks, non-zero exit doesn't mean total failure —
+      // For chainable tasks, non-zero exit doesn't mean total failure —
       // e.g. discover tasks scrape successfully but Playwright exits non-zero
       // because the n8n chat interaction failed or the wait was interrupted.
-      // EXCEPTION: custom_playwright (requirement tests) — non-zero IS a real test
-      // failure that needs to flow back as 'failed' so the webhook reports correctly.
-      let taskStatus
-      if (result.exitCode === 0) {
-        taskStatus = 'completed'
-      } else if (task.type === 'custom_playwright') {
-        taskStatus = 'failed'
-      } else {
-        taskStatus = 'completed_with_warnings'
-      }
+      const taskStatus = result.exitCode === 0 ? 'completed' : 'completed_with_warnings'
       await this.cloud.submitResult(taskId, {
         status: taskStatus,
         output: truncatedOutput,
@@ -649,11 +483,64 @@ class TaskExecutor {
 
       console.log(`[executor] [${ts()}] Task ${taskId} ${taskStatus} in ${Date.now() - startTime}ms${result.exitCode ? ` (exit code ${result.exitCode})` : ''}`)
 
-      // ── Task chaining REMOVED (Apr 26, 2026) ──
-      // All task types (discover, som_batch, inbox_scan) now run as independent scheduled jobs.
-      // Chaining was elegant but fragile — caused Chrome/Playwright process explosions when
-      // scheduled jobs + chains fired simultaneously (e.g. 3 discovers → 3 som_batches → 3 inbox_scans).
-      // Jobs: #761 (discover, hourly), #762 (som_batch, every 2h), #792 (inbox_scan, hourly).
+      // ── Chain: discover → som_batch (DISABLED by default — use separate scheduled jobs) ──
+      // Chain was fragile: browser OOM, process crashes, YAML override bugs.
+      // Now discover (#761) and som_batch (#762) run as independent daily jobs, 15 min apart.
+      // Set chain_outreach=true explicitly to re-enable for manual dispatch.
+      if (task.type === 'discover' && task.config?.chain_outreach === true) {
+        const chainPrompt = task.config?.outreach_prompt || 'limit=15 enrich=1 warmup=1 warmup_likes=3 warmup_follow=0'
+        const chainUserId = task.user_id || task.config?.user_id || this._getConfigUserId()
+        console.log(`[executor] [${ts()}] Chaining: discover complete → som_batch (${chainPrompt})`)
+        try {
+          await this.cloud.submitTask({
+            user_id: chainUserId,
+            title: 'SOM: Outreach Batch (auto)',
+            type: 'som_batch',
+            prompt: chainPrompt,
+            config: { timeout_seconds: 3600, chained_from: taskId },
+            node_id: task.node_id,
+          })
+        } catch (chainErr) {
+          console.log(`[executor] [${ts()}] Chain dispatch failed: ${chainErr.message}`)
+        }
+      }
+
+      // ── Auto-chain: enrich_batch → som_batch ──
+      if (task.type === 'enrich_batch' && task.config?.chain_outreach !== false) {
+        const chainPrompt = task.config?.outreach_prompt || 'limit=15'
+        const chainUserId = task.user_id || task.config?.user_id || this._getConfigUserId()
+        console.log(`[executor] [${ts()}] Chaining: enrich complete → som_batch (${chainPrompt})`)
+        try {
+          await this.cloud.submitTask({
+            user_id: chainUserId,
+            title: 'SOM: Outreach Batch (post-enrich)',
+            type: 'som_batch',
+            prompt: chainPrompt,
+            config: { timeout_seconds: 3600, chained_from: taskId },
+            node_id: task.node_id,
+          })
+        } catch (chainErr) {
+          console.log(`[executor] [${ts()}] Chain dispatch failed: ${chainErr.message}`)
+        }
+      }
+
+      // ── Auto-chain: som_batch → inbox_scan (detect replies) ──
+      if (task.type === 'som_batch' && task.config?.chain_inbox !== false) {
+        const chainUserId = task.user_id || task.config?.user_id || this._getConfigUserId()
+        console.log(`[executor] [${ts()}] Chaining: som_batch complete → inbox_scan`)
+        try {
+          await this.cloud.submitTask({
+            user_id: chainUserId,
+            title: 'SOM: Inbox Reply Scan (auto)',
+            type: 'inbox_scan',
+            prompt: 'all since=4h wb=1',
+            config: { timeout_seconds: 600, chained_from: taskId },
+            node_id: task.node_id,
+          })
+        } catch (chainErr) {
+          console.log(`[executor] [${ts()}] Chain dispatch failed: ${chainErr.message}`)
+        }
+      }
 
       // ── Auto-chain: remotion/remotion_carousel → upload to CDN + post to Buffer ──
       if ((task.type === 'remotion' || task.type === 'remotion_carousel') && task.config?.auto_publish !== false) {
@@ -794,6 +681,30 @@ class TaskExecutor {
           args = ['-c', task.prompt]
           break
 
+        case 'comms_sync': {
+          // Pulse-dispatched silent comms sync. Server queues these every 15 min
+          // for users with stale lead_comms; bridge picks up and runs the iris
+          // CLI sync-comms command which fetches iMessage/Mail/Gmail and POSTs
+          // to /atlas/comms/ingest. Score updates on the next pulse:tick.
+          //
+          // task.config = { lead_ids: [...], days: 30, limit: 50 }
+          const cfg = task.config || {}
+          const leadIds = Array.isArray(cfg.lead_ids) ? cfg.lead_ids : []
+          if (leadIds.length === 0) {
+            reject(new Error('comms_sync: no lead_ids in config'))
+            return
+          }
+          const days = cfg.days || 30
+          const limit = cfg.limit || 50
+
+          // Use the iris binary on PATH; auth comes from ~/.iris/sdk/.env
+          // (FL_API_TOKEN + IRIS_USER_ID are read by the CLI).
+          cmd = 'iris'
+          args = ['leads', 'sync-comms', ...leadIds.map(String), '--days', String(days), '--limit', String(limit)]
+          console.log(`[executor] comms_sync: ${leadIds.length} lead(s), days=${days}`)
+          break
+        }
+
         case 'custom_playwright': {
           // Execute a user-provided Playwright script in an isolated workspace.
           // script_content comes via task.config.script_content (from template or hiveRunScript tool).
@@ -819,52 +730,9 @@ class TaskExecutor {
           ].join('\n')
           fs.writeFileSync(path.join(workspace.dir, 'playwright.config.ts'), pwConfig, 'utf-8')
 
-          // Resolve a hosting project that has @playwright/test installed.
-          // Then symlink its node_modules into the workspace so Node's module
-          // resolution (which walks up from the spec file's location) can find
-          // @playwright/test without needing a per-task npm install.
-          const candidateHosts = [
-            process.env.IRIS_PLAYWRIGHT_HOST,
-            path.resolve(os.homedir(), 'Sites/freelabel'),
-            path.resolve(os.homedir(), 'Sites/freelabel/iris-code'),
-          ].filter(Boolean)
-          let hostDir = null
-          for (const cand of candidateHosts) {
-            if (fs.existsSync(path.join(cand, 'node_modules/@playwright/test/package.json'))) {
-              hostDir = cand
-              break
-            }
-          }
-
-          if (hostDir) {
-            // Symlink host's node_modules into workspace — Node resolves @playwright/test
-            // from the spec file's directory, walks up, finds workspace/node_modules first.
-            const wsNodeModules = path.join(workspace.dir, 'node_modules')
-            try {
-              if (!fs.existsSync(wsNodeModules)) {
-                fs.symlinkSync(path.join(hostDir, 'node_modules'), wsNodeModules, 'dir')
-              }
-            } catch (e) {
-              console.log(`[executor] symlink failed (${e.message}), falling back to NODE_PATH`)
-            }
-            // --workers=2 runs 2 tests in parallel within a single spec (speeds up multi-check requirement runs)
-            const workers = process.env.PLAYWRIGHT_WORKERS || '2'
-            cmd = 'npx'
-            args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`, `--workers=${workers}`]
-            workspace.projectDir = workspace.dir
-            // Belt-and-suspenders: also set NODE_PATH so module resolution can find it
-            workspace.env = { ...(workspace.env || {}), NODE_PATH: path.join(hostDir, 'node_modules') }
-          } else {
-            // Fallback: install @playwright/test into the workspace
-            console.log('[executor] custom_playwright: no host project found, installing @playwright/test in workspace...')
-            await new Promise((resolve, reject) => {
-              const p = spawn('npm', ['install', '--no-save', '@playwright/test@latest'], { cwd: workspace.dir, stdio: 'inherit' })
-              p.on('close', code => code === 0 ? resolve() : reject(new Error(`npm install playwright failed (exit ${code})`)))
-            })
-            cmd = 'npx'
-            args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`]
-            workspace.projectDir = workspace.dir
-          }
+          cmd = 'npx'
+          args = ['playwright', 'test', scriptPath, '--headed', `--timeout=${timeoutMs}`]
+          workspace.projectDir = workspace.dir
           break
         }
 
@@ -921,42 +789,21 @@ class TaskExecutor {
             return
           }
 
-          // ── Campaign config registry (DB-first, som-config.js fallback) ──
-          // Phase 2: reads from iris-api /campaign-templates/daemon-configs
-          const { configs: somCampaignConfigs, source: configSource } = await getCampaignConfigs(freelabelRoot)
-          console.log(`[executor] Campaign configs loaded from ${configSource}`)
+          // ── Campaign config registry (single source of truth) ──
+          // Prevents mismatched board/strategy/account from bad dispatches
+          // Campaign configs from shared source of truth
+          let somCampaignConfigs
+          try {
+            const somConfig = require(path.join(freelabelRoot, 'tests/e2e/som-config.js'))
+            somCampaignConfigs = somConfig.getDaemonConfigs()
+          } catch {
+            // Fallback if shared config not found
+            somCampaignConfigs = {}
+          }
 
           const campaignConfig = somCampaignConfigs[campaign]
           if (!campaignConfig) {
             console.log(`[executor] ⚠️  Unknown SOM campaign: "${campaign}". Valid: ${Object.keys(somCampaignConfigs).join(', ')}`)
-          }
-
-          // ── Preflight: check for eligible leads before launching Chromium ──
-          if (campaignConfig?.boardId) {
-            const preflight = await somPreflightCheck(campaignConfig.boardId, campaignConfig.strategy)
-            console.log(`[executor] Preflight board ${campaignConfig.boardId}: ${preflight.eligible} eligible / ${preflight.total} total — ${preflight.reason}`)
-            if (preflight.skip) {
-              console.log(`[executor] ⏭️  Skipping ${campaign} — ${preflight.reason}`)
-              // Send Discord notification about exhausted leads
-              try {
-                const webhookUrl = process.env.DISCORD_LMKBOT_WEBHOOK
-                if (webhookUrl) {
-                  await fetch(webhookUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      embeds: [{
-                        title: '🚨 SOM — Leads Exhausted (Skipped)',
-                        description: `📋 Board: ${campaignConfig.boardId} | Strategy: ${campaignConfig.strategy} | Account: @${campaignConfig.igAccount}\n✅ ${preflight.reason}\n⚡ Run \`npm run leadgen:${campaign}\` to discover more leads.\n💡 *Chromium was NOT launched — preflight saved compute.*`,
-                        color: 0xFFA500,
-                      }],
-                    }),
-                  })
-                }
-              } catch { /* non-blocking */ }
-              resolve({ skipped: true, reason: preflight.reason })
-              return
-            }
           }
 
           // Use npx playwright directly with --headed to prevent Chrome crashes
@@ -1349,88 +1196,9 @@ class TaskExecutor {
             reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
             return
           }
-
-          // ── Preflight: check ALL active campaigns for eligible leads (DB-first) ──
-          try {
-            const { configs: allConfigs, activeAccounts: activeAccountsList, source } = await getCampaignConfigs(batchRoot)
-            console.log(`[executor] Batch preflight using ${source} (${activeAccountsList.length} active accounts)`)
-            let anyEligible = false
-            const skippedCampaigns = []
-
-            for (const cfg of activeAccountsList) {
-              if (cfg.boardId) {
-                const strategy = allConfigs[cfg.id]?.strategy || null
-                const pf = await somPreflightCheck(cfg.boardId, strategy)
-                console.log(`[executor] Preflight ${cfg.id} (board ${cfg.boardId}): ${pf.eligible} eligible — ${pf.reason}`)
-                if (!pf.skip) anyEligible = true
-                else skippedCampaigns.push(`${cfg.id} (${pf.reason})`)
-              }
-            }
-
-            if (!anyEligible && activeAccountsList.length > 0) {
-              console.log(`[executor] ⏭️  ALL campaigns exhausted — skipping som_batch entirely`)
-              try {
-                const webhookUrl = process.env.DISCORD_LMKBOT_WEBHOOK
-                if (webhookUrl) {
-                  await fetch(webhookUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      embeds: [{
-                        title: '⏭️ SOM Batch — All Campaigns Exhausted (Skipped)',
-                        description: skippedCampaigns.map(c => `• ${c}`).join('\n') + `\n\n💡 *Config source: ${source}*`,
-                        color: 0xFFA500,
-                      }],
-                    }),
-                  })
-                }
-              } catch { /* non-blocking */ }
-              resolve({ skipped: true, reason: 'all_campaigns_exhausted', campaigns: skippedCampaigns })
-              return
-            }
-          } catch (err) {
-            console.log(`[executor] ⚠️  Batch preflight failed: ${err.message} — running anyway`)
-          }
-
           cmd = 'npm'
           args = ['run', 'som:all', '--', ...batchArgs]
           workspace.projectDir = batchRoot
-          break
-        }
-
-        case 'clip_cutter': {
-          // AI-scored clip cutter — runs artisan command on LOCAL Docker (has ffmpeg + assets)
-          // The artisan command queries the production DB for fresh discover content
-          // prompt format: "[key=value ...]" e.g. "brand=discover" or "dry=1" or "threshold=80"
-          const clipParams = task.prompt ? task.prompt.trim().split(/\s+/).filter(Boolean) : []
-          const clipBrand = clipParams.find(p => p.startsWith('brand='))?.split('=')[1] || 'discover'
-          const clipDry = clipParams.find(p => p.startsWith('dry='))?.split('=')[1] === '1'
-          const clipThreshold = clipParams.find(p => p.startsWith('threshold='))?.split('=')[1] || '70'
-          const clipUrl = clipParams.find(p => p.startsWith('url='))?.split('=').slice(1).join('=') || ''
-
-          if (!this.flApiPath) {
-            reject(new Error('fl-api not found. Set FL_API_PATH env var to the Laravel root.'))
-            return
-          }
-
-          if (this.dockerMode === null) {
-            this.dockerMode = isDockerMode()
-          }
-
-          const clipArtisanArgs = ['clips:cut-scheduled', `--brand=${clipBrand}`, `--threshold=${clipThreshold}`]
-          if (clipDry) clipArtisanArgs.push('--dry-run')
-          if (clipUrl) clipArtisanArgs.push(`--url=${clipUrl}`)
-
-          if (this.dockerMode) {
-            const dockerRoot = path.resolve(this.flApiPath, '..')
-            cmd = 'docker'
-            args = ['compose', '-f', path.join(dockerRoot, 'docker-compose.yml'), 'exec', '-T', 'api', 'php', 'artisan', ...clipArtisanArgs]
-            workspace.projectDir = dockerRoot
-          } else {
-            cmd = 'php'
-            args = ['artisan', ...clipArtisanArgs]
-            workspace.projectDir = this.flApiPath
-          }
           break
         }
 
@@ -1447,14 +1215,15 @@ class TaskExecutor {
             return
           }
 
-          // Use DB-first config — same source of truth as SOM outreach
+          // Use shared config — same source of truth as som.js, som-all.js
           let scanAccounts
           try {
-            const { activeAccounts: allActive, source } = await getCampaignConfigs(scanRoot)
-            console.log(`[executor] Inbox scan config from ${source}`)
+            const somConfig = require(path.join(scanRoot, 'tests/e2e/som-config.js'))
+            const activeAccountsObj = somConfig.getActiveAccounts()
+            const activeAccounts = Object.values(activeAccountsObj)
             scanAccounts = scanTarget === 'all'
-              ? allActive
-              : allActive.filter(a => a.igAccount === scanTarget || a.id === scanTarget)
+              ? activeAccounts
+              : activeAccounts.filter(a => a.igAccount === scanTarget || a.id === scanTarget)
           } catch {
             // Fallback: scan heyiris.io only
             scanAccounts = [{ id: 'courses', igAccount: 'heyiris.io', boardId: '38' }]
@@ -1532,10 +1301,10 @@ class TaskExecutor {
             return
           }
 
-          const dpBrand = dpParams.brand || 'discover'
+          const dpBrand = dpParams.brand || 'beatbox'
           const dpStart = dpParams.start || '0:10'
           const dpDuration = dpParams.duration || '90'
-          const dpPlatforms = (dpParams.platforms || 'instagram,tiktok,x').split(',')
+          const dpPlatforms = (dpParams.platforms || 'instagram,tiktok').split(',')
 
           // Call iris-api execute-direct endpoint directly via curl
           // This bypasses the SDK CLI and its .env config issues
@@ -2181,41 +1950,6 @@ exit 1
           break
         }
 
-        case 'youtube_to_clip': {
-          // Clip cutter runs locally (residential IP for YouTube downloads, local LUT files)
-          // prompt format: "url=YOUTUBE_URL start=0:00 duration=90 brand=discover text=Caption"
-          const clipParams = {}
-          const clipParts = task.prompt.trim().split(/\s+/)
-          for (const part of clipParts) {
-            const eqIdx = part.indexOf('=')
-            if (eqIdx > 0) {
-              clipParams[part.substring(0, eqIdx)] = part.substring(eqIdx + 1)
-            }
-          }
-
-          const clipRoot = this.freelabelPath || findFreelabelPath()
-          if (!clipRoot) {
-            reject(new Error('Freelabel project root not found. Set FREELABEL_PATH env var.'))
-            return
-          }
-
-          // Build artisan command — uses local yt-dlp, ffmpeg, and LUT files
-          const clipArgs = [
-            `--youtube_url=${clipParams.url || task.config?.youtube_url || ''}`,
-            `--duration=${clipParams.duration || task.config?.duration || '90'}`,
-            `--start=${clipParams.start || task.config?.start || '0:00'}`,
-          ]
-          if (clipParams.brand || task.config?.brand) clipArgs.push(`--brand=${clipParams.brand || task.config.brand}`)
-          if (clipParams.text || task.config?.text) clipArgs.push(`--text=${clipParams.text || task.config.text}`)
-          if (task.config?.publish_to_social) clipArgs.push('--publish')
-
-          cmd = 'docker'
-          args = ['compose', 'exec', '-T', 'api', 'php', 'artisan', 'clip:process', ...clipArgs]
-          workspace.projectDir = path.join(clipRoot, 'fl-docker-dev')
-          console.log(`[executor] Clip cutter: ${clipParams.url || task.config?.youtube_url} (local processing)`)
-          break
-        }
-
         default:
           // Default: treat prompt as a shell command
           cmd = '/bin/bash'
@@ -2239,7 +1973,6 @@ exit 1
           TASK_TYPE: task.type,
           WORKSPACE_DIR: workspace.dir,
           PROJECT_DIR: workspace.projectDir,
-          ...(workspace.env || {}),
           ...(task.config?.env_vars || {})
         },
         stdio: ['pipe', 'pipe', 'pipe']
@@ -2281,18 +2014,18 @@ exit 1
       const explicit = task.config?.timeout_seconds || (task.timeout_seconds > 600 ? task.timeout_seconds : null)
       const timeout = (explicit || typeDefault) * 1000
       const timeoutLabel = timeout / 1000
-      // custom_playwright: failures = test results, not crashes — preserve output
-      const gracefulTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan', 'custom_playwright']
-      const isGraceful = gracefulTypes.includes(task.type)
+      const chainableTypes = ['discover', 'enrich_batch', 'som_batch', 'som', 'inbox_scan']
+      const isChainable = chainableTypes.includes(task.type)
 
       const timer = setTimeout(() => {
         child.kill('SIGTERM')
         setTimeout(() => {
           if (!child.killed) child.kill('SIGKILL')
         }, 5000)
-        // Browser tasks resolve even on timeout — partial work (scrape, DMs sent)
-        // is still valuable. Report exit code 124 so status shows the timeout.
-        if (isGraceful) {
+        // Chainable tasks must still reach chain logic even on timeout —
+        // e.g. discover scrape + n8n paste already happened, just the wait
+        // got killed. Resolve so chains fire; report exit code for status.
+        if (isChainable) {
           resolve({ exitCode: 124, timedOut: true })
         } else {
           reject(new Error(`Task timed out after ${timeoutLabel}s`))
@@ -2301,9 +2034,10 @@ exit 1
 
       child.on('close', (code) => {
         clearTimeout(timer)
-        // Browser tasks resolve even on non-zero exit — Playwright often exits
-        // non-zero for benign reasons (browser closed early, nav timeout, etc.)
-        if (code === 0 || isGraceful) {
+        // Chainable tasks always resolve so the chain logic runs,
+        // even when Playwright exits non-zero (browser closed early,
+        // n8n chat issue, Ctrl+C, etc.)
+        if (code === 0 || isChainable) {
           resolve({ exitCode: code || 0 })
         } else {
           reject(new Error(`Process exited with code ${code}`))
